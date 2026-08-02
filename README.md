@@ -8,7 +8,9 @@ Editing is a normal targeted diff, not a guarded operation — it does **not** c
 
 It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 
-> **Privacy:** a review sends the full text of your doc to OpenAI (Codex) and Google (Gemini), processed under their respective data policies. Don't peer-review documents with secrets, credentials, or sensitive IP — or limit such docs to the one engine you trust for them.
+> **Privacy — and one caveat about what "choosing the document" protects.** A review sends the full text of your doc to OpenAI (Codex) and Google (Gemini), processed under their respective data policies. Don't peer-review documents with secrets, credentials, or sensitive IP — or limit such docs to the one engine you trust for them.
+>
+> **If you use the `agy` engine, selecting the document is not the whole control.** Its required `read_file(*)` grant lets it read *any* file it asks for, not only the one you named — and it resolves a bare filename by searching the filesystem. So a review could in principle read and quote a file you didn't choose. I tried three narrower grants (`read_file(<path>\*)`, bare `read_file`, forward-slash `**` globs) and agy denied all of them; only the unrestricted wildcard works, so this cannot currently be scoped. What limits it in practice: the prompt names one absolute path, plan mode blocks writes, and command execution stays denied. If that residual isn't acceptable for a given document, use the Gemini CLI engine instead — it needs no grant.
 
 ## What's in this bundle
 - `peer-review/SKILL.md` — the skill itself. Drop the whole `peer-review/` folder into your personal skills directory.
