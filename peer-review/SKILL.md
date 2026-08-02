@@ -71,6 +71,11 @@ tmp=$(mktemp); err=$(mktemp); trap 'rm -f "$tmp" "$err"' EXIT; command -v gemini
 ## Run both in parallel
 Fire both engines in **one assistant message as two separate Bash tool calls** — the harness runs independent tool calls concurrently, so latency ~ `max(codex, gemini)`, not the sum. This is tool-call concurrency, *not* shell `&` backgrounding. Each captures to its own temp files; read both, then merge. **Set a long Bash-tool `timeout` on both calls** (`600000`, 10 min) — the outer backstop above each engine's own inner timeout (Codex 540s, agy 360s, or the Gemini CLI alternative 300s). The tool default is 2 minutes, which would fire *before* either inner timeout and turn a clean engine-level failure into a blunt harness abort (no captured reason, no cleanup).
 
+## Reviewing more than one file
+Bundle them into a single file with `=== FILE: <path> ===` delimiters and review that. Both engines cite per-file sections cleanly from it, which a series of separate reviews doesn't give you — cross-file contradictions are exactly what a single-document review cannot see.
+
+**The bundle must live inside the repo**, not in a scratchpad or temp dir: agy's workspace trust doesn't extend there, so a bundle outside the tree fails the run. Delete it before committing.
+
 ## Reviewing a code diff (not prose)
 For Codex, use the review subcommand: `codex exec review` (reviews git diffs — `--base`, `--uncommitted`, etc.); plain `codex exec "..."` is for static files / prose. Gemini has no diff subcommand — write the diff to a temp file and `@`-include it, or describe the base in the prompt. For diffs, Codex's `review` is the stronger path; add Gemini when you want the second opinion.
 
@@ -109,6 +114,10 @@ A bare "peer review this" is a request for *findings*, not for revisions. Presen
 
 For a doc about to ship or go to a client, re-run **both engines** after revising. A single pass is enough for routine docs.
 
+**Log each round's changes in the document itself** — a short `## Revisions` block saying what round N changed. Engines use it as an anchor on the next pass and visibly narrow their focus to what's new instead of re-deriving the whole document (observed across a three-round run).
+
+**Change the prompt for rounds 2+.** The stock contract asks for a full first-pass review; re-running it verbatim invites the same findings back. Add to the prompt: prior rounds have been applied, the Revisions block records what changed, name any file that is intentionally frozen so it isn't re-flagged, focus on **new** blocker/major findings, and end with an explicit statement if there are none. Both engines honor all of that, and an explicit *"Blockers: none"* is a much cleaner stop signal than silence — which the gate above can't distinguish from a missed sample.
+
 **Stop at whichever comes first:** the latest round added no new blocker/major finding *and* every finding you've tracked is fixed, rejected with a reason, or deferred — **or** you have run 3 rounds, counting the first pass and any that failed. Carry findings and their dispositions forward between rounds; a finding you forget stops being tracked.
 
 **You can reject a blocker/major you've verified is wrong** — false positives happen, and the apply step exists to catch them. Say which finding, why it's wrong, and what you checked. What you *can't* do is reject one because it's inconvenient, or defer a real one silently: those go to the user by name and the run reports incomplete until they decide.
@@ -145,5 +154,6 @@ For agy (Engine 2 above has the command and its setup steps — don't duplicate 
 - Every call denied regardless of grants → the **workspace-trust gate**, not permissions. Run `agy` interactively once from the tree you review in and accept the prompt. This one impersonates a permissions failure convincingly.
 - Empty output, exit 0, ~5 min → you passed `--sandbox`. Don't.
 - Review of the wrong document → a relative path was passed. See the absolute-path rule in Engine 2.
+- **A layout finding that doesn't match the file** — "broken table row", "cell split mid-word", "malformed list" — is likely an artifact of agy's own line-wrapped view of long lines, not something in the bytes. Observed on a Markdown table whose row was a single unbroken line. Check the actual file before accepting any finding about *formatting*; content findings don't have this failure mode.
 
 *Note on sources:* the widely-cited `dispatch` plugin documents agy as having no read-only mode, no structured output, and headless auto-approval. That was accurate for agy 1.0.x — Google has since added `--mode plan` and inverted the headless default to fail-closed. Verify flags against your installed version rather than any third-party write-up, this one included.
