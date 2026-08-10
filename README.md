@@ -16,7 +16,7 @@ It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 - `peer-review/SKILL.md` — the skill itself. Drop the whole `peer-review/` folder into your personal skills directory.
 - `claude-md-snippet.md` — a few lines to append to your `~/.claude/CLAUDE.md` so Claude reaches for the skill *proactively* (without being asked). Optional but recommended.
 
-The prior single-engine (Codex-only) version lives in its own repo, `codex-review-skill`, kept untouched as a back-pocket fallback — `peer-review` is its two-engine successor.
+`peer-review` supersedes the earlier single-engine `codex-review-skill`, which is retired. There's no need for a separate Codex-only skill: run this one with just the Codex engine available and you get the same single-engine review, plus an explicit note that coverage was partial.
 
 ## Prerequisites (these do NOT travel inside the file)
 **At least one engine must be installed and authenticated, or every run fails.** With one, you get a usable single-engine review that says it's partial. With both, you get what the skill is actually for — two labs' models disagreeing. The `superpowers` plugin is recommended but optional.
