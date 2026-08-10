@@ -52,6 +52,8 @@ Linux and Git Bash have them. **Stock macOS has neither** — `brew install core
 
    Skip either step and every headless call is denied. The failure is loud rather than silent, but agy's error names the wrong config file, so it costs time. Verified `authMethod=consumer` with no Cloud project billed. `SKILL.md` § *Engine 2* has the command — in particular, **never add `--dangerously-skip-permissions`**, which overrides the read-only mode.
 
+   One post-install trap: an Antigravity auto-update has been seen (2026-08-06) to delete the on-PATH launcher directory and leave the CLI at `%LOCALAPPDATA%\agy\bin\agy.exe` without re-adding it to PATH — so if `agy` vanishes from your shell after an update, look there first and put that directory back on your PATH.
+
    **(b) Google Gemini CLI — recommended if you don't have a subscription, or want less setup.** No permission grants to configure, and its workspace-trust gate is bypassed headlessly by the `--skip-trust` flag already in the command; `--approval-mode plan` is enforced out of the box. You still need to install it and authenticate (below).
    ```
    npm i -g @google/gemini-cli
