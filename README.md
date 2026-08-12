@@ -1,6 +1,6 @@
 # peer-review — shared Claude Code skill
 
-An independent **peer review** for specs, plans, and design docs, driven through two CLIs — OpenAI's Codex and a Google Gemini model. You finish a doc; the skill runs both against it from the shell in parallel, merges their findings into one severity-ordered list tagged by which engine raised each, and applies the worthwhile ones — no copy-pasting between tools. If one engine is missing or down, the review still runs on the other **and says so**. The catches only one engine makes are the point: a flaw caught in a spec now is far cheaper than the same flaw in the code built from it later.
+An independent **peer review** for specs, plans, and design docs, driven through two CLIs — OpenAI's Codex and a Google Gemini model — plus, optionally, an open-weight roster (DeepSeek, Moonshot's Kimi) on the Fireworks AI API. You finish a doc; the skill runs every available engine against it from the shell in parallel, merges their findings into one severity-ordered list tagged by which engine raised each, and applies the worthwhile ones — no copy-pasting between tools. If an engine is missing or down, the review still runs on the others **and says so**. The catches only one engine makes are the point: a flaw caught in a spec now is far cheaper than the same flaw in the code built from it later.
 
 **It reports by default and edits only when you ask.** "Peer review this" gets you findings. "Review and fix it" gets you a revised file. Proactive reviews (below) always report only.
 
@@ -8,7 +8,7 @@ Editing is a normal targeted diff, not a guarded operation — it does **not** c
 
 It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 
-> **Privacy — and one caveat about what "choosing the document" protects.** A review sends the full text of your doc to OpenAI (Codex) and Google (Gemini), processed under their respective data policies. Don't peer-review documents with secrets, credentials, or sensitive IP — or limit such docs to the one engine you trust for them.
+> **Privacy — and one caveat about what "choosing the document" protects.** A review sends the full text of your doc to OpenAI (Codex) and Google (Gemini) — and, **if `FIREWORKS_API_KEY` is set in your environment**, to Fireworks AI as well, each processed under their respective data policies. The key being set is the whole enablement switch: a key set globally for unrelated Fireworks work turns the roster on. Opt out by unsetting the key for the session or removing the Engine 3 section from your installed copy. Don't peer-review documents with secrets, credentials, or sensitive IP — or limit such docs to the one engine you trust for them.
 >
 > **If you use the `agy` engine, selecting the document is not the whole control.** Its required `read_file(*)` grant lets it read *any* file it asks for, not only the one you named — and it resolves a bare filename by searching the filesystem. So a review could in principle read and quote a file you didn't choose. I tried three narrower grants (`read_file(<path>\*)`, bare `read_file`, forward-slash `**` globs) and agy denied all of them; only the unrestricted wildcard works, so this cannot currently be scoped. What limits it in practice: the prompt names one absolute path, plan mode blocks writes, and command execution stays denied. If that residual isn't acceptable for a given document, use the Gemini CLI engine instead — it needs no grant.
 
@@ -19,16 +19,16 @@ It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 `peer-review` supersedes the earlier single-engine `codex-review-skill`, which is retired. There's no need for a separate Codex-only skill: run this one with just the Codex engine available and you get the same single-engine review, plus an explicit note that coverage was partial.
 
 ## Prerequisites (these do NOT travel inside the file)
-**At least one engine must be installed and authenticated, or every run fails.** With one, you get a usable single-engine review that says it's partial. With both, you get what the skill is actually for — two labs' models disagreeing. The `superpowers` plugin is recommended but optional.
+**At least one engine must be installed and authenticated, or every run fails.** With one, you get a usable single-engine review that says it's partial. With more, you get what the skill is actually for — different labs' models disagreeing. The `superpowers` plugin is recommended but optional.
 
-**Shell requirements — check these first if *both* engines fail identically.** The commands run under bash (Git Bash on Windows, not PowerShell) and need GNU `timeout` (with `-k`) and `realpath`:
+**Shell requirements — check these first if *all* engines fail identically.** The commands run under bash (Git Bash on Windows, not PowerShell) and need GNU `timeout` (with `-k`) and `realpath`:
 
 ```bash
 command -v timeout      # must print a path
 command -v realpath     # must print a path
 ```
 
-Linux and Git Bash have them. **Stock macOS has neither** — `brew install coreutils` and ensure the GNU versions are on `PATH`. Without them both engines fail the same way, which is a single point of failure rather than the independent degradation described below, so it doesn't look like a missing CLI.
+Linux and Git Bash have them. **Stock macOS has neither** — `brew install coreutils` and ensure the GNU versions are on `PATH`. Without them every engine fails the same way, which is a single point of failure rather than the independent degradation described below, so it doesn't look like a missing CLI.
 
 1. **OpenAI Codex CLI — installed and logged in.** The skill only *drives* Codex; it doesn't bundle it. Without it, the Codex engine is unavailable and the skill falls back to Gemini-only — and if *neither* engine is installed, every run fails.
    ```
@@ -65,7 +65,8 @@ Linux and Git Bash have them. **Stock macOS has neither** — `brew install core
    Note that [Google's own auth docs](https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html) still say AI Pro/Ultra subscribers can log in, and mention neither the June change nor Antigravity. That page is stale; the error you get is accurate.
 
    Either path is optional in practice: if no Gemini engine is available, the skill runs Codex-only and says so.
-3. **The `superpowers` plugin.** The skill delegates to `superpowers:receiving-code-review` for the "apply the findings rigorously" step. These are skill *names*, not file paths, so they survive superpowers version/folder changes — but if superpowers isn't installed they fall back to a generic principle (the skill still runs, you just lose the detailed checklist). Install it from the official Claude Code plugin marketplace:
+3. **Optional — a Fireworks AI API key for the open-weight roster.** Without it the skill runs exactly as before on Codex + Gemini; with it, two more labs join every review. Create a key in the Fireworks dashboard (fireworks.ai), then set it as `FIREWORKS_API_KEY` in your environment (Windows: user environment variable, then restart your terminal; macOS/Linux: your shell profile). Billing is pay-as-you-go per token — a typical doc review across both roster models costs cents, and the edit-loop multiplies that by rounds. No CLI to install: the engine drives the REST API with `curl` + `node` — node is already required above, and curl ships with Git Bash, macOS, and Linux.
+4. **The `superpowers` plugin.** The skill delegates to `superpowers:receiving-code-review` for the "apply the findings rigorously" step. These are skill *names*, not file paths, so they survive superpowers version/folder changes — but if superpowers isn't installed they fall back to a generic principle (the skill still runs, you just lose the detailed checklist). Install it from the official Claude Code plugin marketplace:
    ```
    /plugin marketplace add anthropics/claude-plugins-official
    /plugin install superpowers@claude-plugins-official
@@ -117,8 +118,9 @@ This edits the file in place. It does not checkpoint for you — a dirty tree is
 
 **What comes back** is one severity-ordered list, each finding tagged by origin:
 
-- `[Both]` — both engines raised it. **Higher priority to verify, not an auto-fix** — two models can converge on the same wrong call from shared context.
-- `[Codex]` / `[Gemini]` — only one engine raised it. These are the marginal catches the second engine exists for. Scrutinize them; don't discount them for being unconfirmed.
+- The report opens with a **panel line** saying which engines reviewed and which were missing — read it before weighing the tags.
+- Multi-engine tags (`[Codex+Kimi]`, `[All]`) — several engines converged. **Higher priority to verify, not an auto-fix** — models sharing the same document and prompt can converge on the same wrong call.
+- Single tags (`[Codex]`, `[Gemini]`, `[DeepSeek]`, `[Kimi]`) — one engine's marginal catch. Scrutinize them; don't discount them for being unconfirmed.
 
 If you asked it to apply the findings, it then tells you what it changed, what it rejected and why, and which engine surfaced anything non-obvious.
 
@@ -139,11 +141,11 @@ The fix turned out to be removing the flag entirely. Two setup steps nobody had 
 Worth noting what the review was actually asked about: repository naming and licensing. The security finding was volunteered, wasn't confirmed by the other engine, and contradicted reasoning that had already been written down and tested. That combination — single-engine, unsolicited, contradicting the author — is exactly what the `[Codex]` / `[Gemini]` tags exist to make you look at twice.
 
 ## Verify it loaded
-In a new session, ask for a review on any markdown file. If the skill loaded, it runs both engines and reports which ones answered.
+In a new session, ask for a review on any markdown file. If the skill loaded, it runs every engine it finds and reports which answered.
 
-Missing or unauthenticated engines degrade gracefully — you get the other engine's findings plus a note. If *both* fail, check the engine prerequisites — and if they fail *identically*, check the shell requirements above, since missing `timeout`/`realpath` takes down both at once.
+Missing or unauthenticated engines degrade gracefully — you get the remaining engines' findings plus a note. If *all* fail, check the engine prerequisites — and if they fail *identically*, check the shell requirements above, since missing `timeout`/`realpath` takes down every engine at once.
 
-**Treat a single-engine result as partial coverage.** The premise is that two labs' models catch different things, so a one-engine review is worth materially less than a two-engine one. The output says which happened; read that line before acting on the findings.
+**Treat a single-engine result as partial coverage.** The premise is that different labs' models catch different things, so a one-engine review is worth materially less than a full-panel one. The output says which happened; read that line before acting on the findings.
 
 ## Note on errors
 If Codex throws `unknown variant 'priority'` or `model requires a newer version of Codex`, the standalone CLI is lagging behind the Codex desktop app (they share `~/.codex/config.toml`). Fix by updating the CLI: `npm i -g @openai/codex@latest`. The SKILL.md's Troubleshooting section covers this in full.
