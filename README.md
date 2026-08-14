@@ -4,7 +4,7 @@ An independent **peer review** for specs, plans, and design docs, driven through
 
 **It reports by default and edits only when you ask.** "Peer review this" gets you findings. "Review and fix it" gets you a revised file. Proactive reviews (below) always report only.
 
-Editing is a normal targeted diff, not a guarded operation — it does **not** checkpoint for you, and it won't refuse on an uncommitted file, since the doc you just wrote is uncommitted by definition. It pauses only when an edit would destroy work it can't see you making (changes from before this session, or a fix needing whole-section rewrites). **Commit or stash first if the file holds work you can't afford to lose.**
+Editing is a normal targeted diff, not a guarded operation — it does **not** checkpoint for you, and it won't refuse on an uncommitted file, since the doc you just wrote is uncommitted by definition. There is one real check behind that: it hashes every file it might edit when the review starts and again before editing, so if a file moved underneath it — you edited in another window, a formatter ran — it stops rather than patching a version the engines never saw. That narrows the window rather than sealing it: the check and the write are separate steps, so it can't catch a change that lands between them. And it says nothing about work that was already sitting in the file when the run began; for that, and for any fix large enough to rewrite whole sections, it looks at `git status` and tells you what it would overwrite. **Commit or stash first if the file holds work you can't afford to lose.**
 
 It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 
