@@ -144,6 +144,12 @@ The fix turned out to be removing the flag entirely. Two setup steps nobody had 
 
 Worth noting what the review was actually asked about: repository naming and licensing. The security finding was volunteered, wasn't confirmed by the other engine, and contradicted reasoning that had already been written down and tested. That combination — single-engine, unsolicited, contradicting the author — is exactly what the `[Codex]` / `[Gemini]` tags exist to make you look at twice.
 
+## Check your setup before a review
+
+`SKILL.md` § *Preflight* holds a copy-pasteable block that checks the whole panel — the shell dependencies, Codex's login, agy's reachability and pinned model, the Gemini CLI's presence, and your Fireworks key plus both roster pins — in about a minute and **without spending any review tokens**. Ask for it in plain language ("run the peer-review preflight"), or open the file and copy the block.
+
+Run it after upgrading a CLI, on a new machine, or any time a review fails in a way that doesn't name a cause. It's the fastest way to catch the failure that looks worst: missing `timeout`/`realpath` takes down *every* engine at once, which reads like the skill being broken rather than one absent dependency.
+
 ## Verify it loaded
 In a new session, ask for a review on any markdown file. If the skill loaded, it runs every engine it finds and reports which answered.
 
