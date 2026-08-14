@@ -8,9 +8,9 @@ Editing is a normal targeted diff, not a guarded operation — it does **not** c
 
 It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 
-> **Privacy — and one caveat about what "choosing the document" protects.** A review sends the full text of your doc to OpenAI (Codex) and Google (Gemini) — and, **if `FIREWORKS_API_KEY` is set in your environment**, to Fireworks AI as well, each processed under their respective data policies. The key being set is the whole enablement switch: a key set globally for unrelated Fireworks work turns the roster on. Opt out by unsetting the key for the session or removing the Engine 3 section from your installed copy. Don't peer-review documents with secrets, credentials, or sensitive IP — or limit such docs to the one engine you trust for them.
+> **Privacy — and one caveat about what "choosing the document" protects.** A review sends the full text of your doc to OpenAI (Codex) and Google (Gemini) — and, **if `FIREWORKS_API_KEY` is set in your environment**, to Fireworks AI as well, each processed under their respective data policies. The key being set is the whole enablement switch: a key set globally for unrelated Fireworks work turns the roster on. Opt out by unsetting the key for the session or removing the Engine 3 section from your installed copy. Don't peer-review documents with secrets, credentials, or sensitive IP. **There is no per-run engine selector** — the engines that run are the ones installed and authenticated, so restricting a single sensitive document to one engine means unsetting `FIREWORKS_API_KEY` for that session and not having the others installed, not a flag you pass. If you need that regularly, the skill isn't currently built for it — a known gap, not an oversight.
 >
-> **If you use the `agy` engine, selecting the document is not the whole control.** Its required `read_file(*)` grant lets it read *any* file it asks for, not only the one you named — and it resolves a bare filename by searching the filesystem. So a review could in principle read and quote a file you didn't choose. I tried three narrower grants (`read_file(<path>\*)`, bare `read_file`, forward-slash `**` globs) and agy denied all of them; only the unrestricted wildcard works, so this cannot currently be scoped. What limits it in practice: the prompt names one absolute path, plan mode blocks writes, and command execution stays denied. If that residual isn't acceptable for a given document, use the Gemini CLI engine instead — it needs no grant.
+> **If you use the `agy` engine, selecting the document is not the whole control.** Its required `read_file(*)` grant lets it read *any* file it asks for, not only the one you named — and it resolves a bare filename by searching the filesystem. So a review could in principle read and quote a file you didn't choose. I tried three narrower grants (`read_file(<path>\*)`, bare `read_file`, forward-slash `**` globs) and agy denied all of them; only the unrestricted wildcard works, so this cannot currently be scoped. **Be clear about what does and does not limit it.** Plan mode blocks *writes* and shell execution, not *reads*, and naming one absolute path in the prompt is an instruction, not an enforced boundary — so a document carrying injected instructions can ask agy to read some other file and quote it back inside the review. Two consequences worth stating plainly: "don't review documents with secrets" doesn't cover this, because the secret is in a *different* file; and anything quoted into a merged report is then sent to every other engine on the next round, turning a local over-read into disclosure to several vendors. **The control that actually works is not using `agy` for documents you didn't author** — use the Gemini CLI engine for those; it needs no grant at all.
 
 ## What's in this bundle
 - `peer-review/SKILL.md` — the skill itself. Drop the whole `peer-review/` folder into your personal skills directory.
@@ -19,7 +19,7 @@ It's a *personal* Claude Code skill: a single self-contained `SKILL.md`.
 `peer-review` supersedes the earlier single-engine `codex-review-skill`, which is retired. There's no need for a separate Codex-only skill: run this one with just the Codex engine available and you get the same single-engine review, plus an explicit note that coverage was partial.
 
 ## Prerequisites (these do NOT travel inside the file)
-**At least one engine must be installed and authenticated, or every run fails.** With one, you get a usable single-engine review that says it's partial. With more, you get what the skill is actually for — different labs' models disagreeing. The `superpowers` plugin is recommended but optional.
+**At least one engine must be available, or every run fails.** "Available" means an installed, authenticated CLI (Codex or Gemini) **or** a `FIREWORKS_API_KEY` in your environment — the roster needs no CLI, so a key-only setup is a valid single-engine configuration. With one engine, you get a usable review that says it's partial. With more, you get what the skill is actually for — different labs' models disagreeing. The `superpowers` plugin is recommended but optional.
 
 **Shell requirements — check these first if *all* engines fail identically.** The commands run under bash (Git Bash on Windows, not PowerShell) and need GNU `timeout` (with `-k`) and `realpath`:
 
@@ -28,14 +28,14 @@ command -v timeout      # must print a path
 command -v realpath     # must print a path
 ```
 
-Linux and Git Bash have them. **Stock macOS has neither** — `brew install coreutils` and ensure the GNU versions are on `PATH`. Without them every engine fails the same way, which is a single point of failure rather than the independent degradation described below, so it doesn't look like a missing CLI.
+Linux and Git Bash have them. **Stock macOS has neither** — `brew install coreutils`, then put Homebrew's `gnubin` directory on `PATH` (`export PATH="$(brew --prefix)/opt/coreutils/libexec/gnubin:$PATH"`). Without that second step Homebrew installs them as `gtimeout`/`grealpath`, which these commands do not call, so the checks above still fail. Without them every engine fails the same way, which is a single point of failure rather than the independent degradation described below, so it doesn't look like a missing CLI.
 
-1. **OpenAI Codex CLI — installed and logged in.** The skill only *drives* Codex; it doesn't bundle it. Without it, the Codex engine is unavailable and the skill falls back to Gemini-only — and if *neither* engine is installed, every run fails.
+1. **OpenAI Codex CLI — installed and logged in.** The skill only *drives* Codex; it doesn't bundle it. Without it, the Codex engine is unavailable and the skill runs on whatever else is available — and if *no* engine is available at all (no CLI installed, no Fireworks key), every run fails.
    ```
    npm i -g @openai/codex@latest
    codex            # run once to sign in (ChatGPT account or API key)
    ```
-2. **A Gemini engine — pick one.** Neither will execute shell commands embedded in a document you review — verified on both by asking each to run one mid-review, which each refused. They differ in cost, setup effort, and read scope.
+2. **A Gemini engine — pick one.** Both refused to execute a shell command embedded in a reviewed document when tested on 2026-08-01 — treat that as a dated test result, not a standing guarantee: these CLIs auto-update and change behavior (this README documents one such change), so re-check it yourself if it matters to you. Note also that refusing to *execute* is not refusing to *read* — see the `agy` caveat above. They differ in cost, setup effort, and read scope.
 
    **(a) Antigravity's `agy` — recommended if you have a Gemini subscription.** Runs on plan quota rather than API billing. Install Antigravity from [antigravity.google](https://antigravity.google), then **two one-time setup steps, both required**:
 
@@ -90,7 +90,7 @@ New-Item -ItemType Directory -Force "$HOME/.claude/skills" | Out-Null
 Copy-Item -Recurse -Force peer-review "$HOME/.claude/skills/"
 ```
 
-**Optional — proactive triggering.** Append `claude-md-snippet.md` to `~/.claude/CLAUDE.md`. Read that file first: it makes reviews happen unasked, which means documents go to OpenAI and Google without a per-run decision. **Check it isn't already there before appending** — a second copy is harmless but confusing, and there's no uninstall beyond deleting the lines.
+**Optional — proactive triggering.** Append `claude-md-snippet.md` to `~/.claude/CLAUDE.md`. Read that file first: it makes reviews happen unasked, which means documents go to OpenAI, Google, and — if `FIREWORKS_API_KEY` is set — Fireworks AI (DeepSeek and Moonshot models) without a per-run decision. **Check it isn't already there before appending** — a second copy is harmless but confusing, and there's no uninstall beyond deleting the lines.
 
 **To update later**, re-clone or `git pull`, then re-copy `peer-review/`. Copies don't track the repo, so fixes here don't reach an installed copy until you do.
 
@@ -114,7 +114,7 @@ Review docs/my-spec.md and fix what it finds
 
 This edits the file in place. It does not checkpoint for you — a dirty tree is the normal case right after writing a doc, so gating on it would stall every run. Commit or stash first if the file holds work you'd hate to lose.
 
-**Proactive triggering** (if you installed `claude-md-snippet.md`): the skill fires on its own after Claude writes or substantially revises a spec, plan, or design doc. **It reports only — a review you didn't ask for never rewrites your file.** Note that it does send the document to OpenAI and Google without asking; the snippet instructs Claude to check with you first if the content looks sensitive, but if that trade isn't right for you, skip the snippet and invoke the skill by hand.
+**Proactive triggering** (if you installed `claude-md-snippet.md`): the skill fires on its own after Claude writes or substantially revises a spec, plan, or design doc. **It reports only — a review you didn't ask for never rewrites your file.** Note that it does send the document to OpenAI, Google, and — when the Fireworks key is set — Fireworks AI, without asking; the snippet instructs Claude to check with you first if the content looks sensitive, but if that trade isn't right for you, skip the snippet and invoke the skill by hand.
 
 **What comes back** is one severity-ordered list, each finding tagged by origin:
 
