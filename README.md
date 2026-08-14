@@ -120,7 +120,9 @@ This edits the file in place. It does not checkpoint for you — a dirty tree is
 
 **What comes back** is one severity-ordered list, each finding tagged by origin:
 
-- The report opens with a **panel line** saying which engines reviewed, which were missing or failed, and which you excluded on purpose — read it before weighing the tags.
+- The report opens with a **panel line** saying which engines reviewed, which were missing or failed, which you excluded on purpose, and which came back **INCOMPLETE** — read it before weighing the tags.
+
+  That last state exists because the CLI engines have no truncation signal: given a file too large to read fully, Codex and Gemini return a fluent review of the part they saw, indistinguishable from a complete one. Every engine is therefore asked to quote the document's last non-empty line, which gets checked against the file — a mismatch means that engine's coverage is unverified, and its findings get tagged as partial. It catches a read that stopped early. It can't prove an engine attended to everything in between, and it isn't adversary-proof: a document can simply tell the reviewer what to quote.
 - Multi-engine tags (`[Codex+Kimi]`, `[All]`) — several engines converged. **Higher priority to verify, not an auto-fix** — models sharing the same document and prompt can converge on the same wrong call.
 - Single tags (`[Codex]`, `[Gemini]`, `[DeepSeek]`, `[Kimi]`) — one engine's marginal catch. Scrutinize them; don't discount them for being unconfirmed.
 
