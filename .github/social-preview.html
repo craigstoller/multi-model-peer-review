@@ -1,0 +1,61 @@
+<!doctype html>
+<!--
+  Source for this repo's GitHub social preview image (Settings > General > Social preview).
+  Re-render: capture this page at exactly 1280x640 (e.g. chrome --headless --screenshot=out.png --window-size=1280,640 file:///...), downscale to 1280x640 if the capture is DPR-scaled, keep under 1 MB, then upload manually - there is no API for social previews.
+-->
+
+<html><head><meta charset="utf-8"><style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { width:1280px; height:640px; overflow:hidden; position:relative;
+    background:#081020; font-family:"Segoe UI",system-ui,sans-serif; }
+  .glow { position:absolute; right:-160px; top:-180px; width:800px; height:800px;
+    background:radial-gradient(circle, rgba(66,133,244,.22) 0%, rgba(66,133,244,0) 62%); }
+  .glow2 { position:absolute; left:-240px; bottom:-260px; width:720px; height:720px;
+    background:radial-gradient(circle, rgba(16,163,127,.13) 0%, rgba(16,163,127,0) 60%); }
+  .grid { position:absolute; inset:0;
+    background-image:linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size:48px 48px; }
+  .content { position:absolute; left:84px; top:128px; width:640px; }
+  .owner { font-family:ui-monospace,Consolas,monospace; font-size:26px; color:#7d8db0; letter-spacing:.5px; }
+  h1 { font-family:ui-monospace,Consolas,monospace; font-size:57px; font-weight:700;
+    color:#eef3fb; margin-top:10px; letter-spacing:-1px; line-height:1.1; }
+  h1 .accent { color:#6ea8ff; }
+  .tag { margin-top:24px; font-size:30px; line-height:1.45; color:#a9b6d0; font-weight:350; }
+  .tag b { color:#e4ecfa; font-weight:600; }
+  .chips { position:absolute; left:84px; bottom:70px; display:flex; gap:13px; }
+  .chip { font-family:ui-monospace,Consolas,monospace; font-size:20px; padding:9px 20px;
+    border-radius:999px; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.22); }
+  .codex { color:#5fd4b0; border-color:rgba(16,163,127,.55); }
+  .gemini { color:#8ab8ff; border-color:rgba(66,133,244,.55); }
+  .deepseek { color:#9fa8ff; border-color:rgba(83,109,254,.55); }
+  .kimi { color:#d9a0ff; border-color:rgba(186,104,255,.55); }
+  .art { position:absolute; right:88px; top:50%; transform:translateY(-50%); }
+</style></head><body>
+  <div class="glow"></div><div class="glow2"></div><div class="grid"></div>
+  <div class="content">
+    <div class="owner">craigstoller /</div>
+    <h1>multi-model<br><span class="accent">-peer-review</span></h1>
+    <div class="tag">A <b>Claude Code skill</b>: independent review of your specs &amp; plans by a panel of other models.</div>
+  </div>
+  <div class="chips">
+    <div class="chip codex">Codex</div><div class="chip gemini">Gemini</div>
+    <div class="chip deepseek">DeepSeek</div><div class="chip kimi">Kimi</div>
+  </div>
+  <svg class="art" width="360" height="400" viewBox="0 0 360 400" fill="none">
+    <line x1="52" y1="70"  x2="205" y2="185" stroke="rgba(16,163,127,.6)"  stroke-width="4"/>
+    <line x1="40" y1="160" x2="205" y2="195" stroke="rgba(66,133,244,.6)"  stroke-width="4"/>
+    <line x1="40" y1="250" x2="205" y2="210" stroke="rgba(83,109,254,.6)"  stroke-width="4"/>
+    <line x1="52" y1="340" x2="205" y2="222" stroke="rgba(186,104,255,.6)" stroke-width="4"/>
+    <circle cx="52" cy="70"  r="21" fill="#10a37f"/>
+    <circle cx="40" cy="160" r="21" fill="#4285f4"/>
+    <circle cx="40" cy="250" r="21" fill="#536dfe"/>
+    <circle cx="52" cy="340" r="21" fill="#ba68ff"/>
+    <rect x="200" y="118" width="128" height="168" rx="14" fill="rgba(8,16,32,.7)" stroke="#7fa7e8" stroke-width="4.5"/>
+    <line x1="222" y1="156" x2="306" y2="156" stroke="rgba(170,196,238,.75)" stroke-width="7" stroke-linecap="round"/>
+    <line x1="222" y1="184" x2="306" y2="184" stroke="rgba(170,196,238,.45)" stroke-width="7" stroke-linecap="round"/>
+    <line x1="222" y1="212" x2="284" y2="212" stroke="rgba(170,196,238,.45)" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="306" cy="270" r="34" fill="#12b981"/>
+    <path d="M290 270 l11 12 l21 -24" stroke="#04140d" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </svg>
+</body></html>
