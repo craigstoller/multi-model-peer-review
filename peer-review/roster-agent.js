@@ -14,9 +14,9 @@
 //   node <skill-dir>/roster-agent.js <doc-path> <repo-root>
 //   environment: FW_MODEL, FW_PROMPT_REPO_AWARE, FIREWORKS_API_KEY
 //
-// Spec: "Repo-aware roster route -- design" (roadmap R8, 2026-08-19), plus
+// Spec: "Repo-aware roster route -- design" (designed 2026-08-19), plus
 // the final-phase state machine of "The synthesis turn: keep the tools,
-// retry the empty reply" (roadmap R9, 2026-08-20): the final phase keeps
+// retry the empty reply" (designed 2026-08-20): the final phase keeps
 // `tools` in the request, a tool call emitted there is refused rather than
 // serviced, and a final reply that leaves nothing durable is retried at most
 // twice per run.
