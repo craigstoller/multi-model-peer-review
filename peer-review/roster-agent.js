@@ -522,8 +522,24 @@ const TOOL_SCHEMAS = [
 // there; nothing here may re-implement them).
 const MAX_ITERATIONS = 12;              // loop rounds before a forced synthesis turn
 const MAX_TOOL_CALLS_PER_ITER = 8;      // tool_calls serviced per assistant message
-const WALL_CLOCK_MS = 10 * 60 * 1000;   // whole-run budget
-const REQUEST_TIMEOUT_CAP_MS = 120 * 1000; // per-HTTP-request ceiling
+// R11: the run's one authoritative deadline. Deliberately 555s, not 600s --
+// 15s of shutdown margin under the CLI's outer `timeout -k 10 570` bound, so
+// a late failure is REPORTED (status incomplete, with whatever text/trace
+// exists) instead of silently hard-killed by the process timeout at 570s.
+// This is a spec change from the pre-R11 value (600000): the bound R11
+// resizes is the PER-REQUEST cap below, never this one -- WALL_CLOCK_MS
+// moves only to fix the 600s-vs-570s deadline incoherence, not to grant more
+// wall-clock budget.
+const WALL_CLOCK_MS = 555 * 1000;       // whole-run budget
+const REQUEST_TIMEOUT_CAP_MS = 120 * 1000; // per-HTTP-request ceiling (SHORT allowance)
+// R11: the LONG allowance for a request evaluated fresh at send time as
+// either (a) latched by cumulative ingested bytes, or (b) in the final
+// (synthesis) phase -- see requestTimeoutMs() below, which is the sole
+// place selection happens. Every request still passes through
+// min(allowance, remainingMs()) with the same Math.max(1, ...) timer floor
+// as before: the bound is RESIZED for these two cases, never removed.
+const LONG_REQUEST_TIMEOUT_CAP_MS = 480 * 1000; // per-HTTP-request ceiling (LONG allowance)
+const LONG_RUN_INGEST_BYTES = 256 * 1024;       // ctx.budget.bytes latch threshold for the LONG allowance
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -811,6 +827,7 @@ function emptyCaps() {
     contextLengthSalvageAttempted: false, contextLengthSalvageSucceeded: false, evidenceDiscarded: false,
     fileContentBytes: 0, noFileContentRead: true,
     emptyFinalRetries: 0, refusedFinalVolleys: 0,
+    longAllowanceRequests: 0,
   };
 }
 
@@ -851,7 +868,13 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   const cancelTimeout = typeof clearTimeoutImpl === "function" ? clearTimeoutImpl : clearTimeout;
   const startTime = clockNow();
   const remainingMs = () => WALL_CLOCK_MS - (clockNow() - startTime);
-  const requestTimeoutMs = () => Math.max(0, Math.min(REQUEST_TIMEOUT_CAP_MS, remainingMs()));
+  // requestTimeoutMs() itself is defined further below, once `ctx` and
+  // `flags` exist -- R11's selection reads ctx.budget.bytes and
+  // flags.inFinalPhase, both declared inside the try block below, and a
+  // `const` declared inside a block is not visible to a closure defined
+  // textually before that block even though the closure only ever RUNS
+  // later. Defining it here (as pre-R11 code did, when it needed neither)
+  // would throw a ReferenceError on first call.
 
   // --- Startup order. Load-bearing: steps 1-4 below must run in exactly
   // this order, and each numbered comment says what breaks if they do not. ---
@@ -966,6 +989,38 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   const flags = {
     iterationsCapHit: false, wallClockCapHit: false,
     contextLengthSalvageAttempted: false, contextLengthSalvageSucceeded: false, evidenceDiscarded: false,
+    // R11: inFinalPhase is set exactly once, at runFinalPhase's entry (E or
+    // N -- runFinalPhase is the single function serving both), and never
+    // cleared. It is the ONLY final-phase signal requestTimeoutMs() below
+    // may read -- NEVER inferred from withTools, which is true on every
+    // exploration request too. longAllowanceRequests lives here (not a
+    // separate module-level counter) so computeCaps() below can see it the
+    // same way it sees iterationsCapHit and friends; it is incremented once
+    // per HTTP send, at the dispatch site in singleRequest, never inside
+    // requestTimeoutMs() itself (a pure getter that may be evaluated more
+    // than once per attempt).
+    inFinalPhase: false, longAllowanceRequests: 0,
+  };
+  // R11 -- the request-timeout allowance selector. Defined here (not
+  // earlier, alongside remainingMs) because it reads ctx.budget.bytes and
+  // flags.inFinalPhase, both declared just above; see the comment at
+  // remainingMs's definition for why this placement is load-bearing, not
+  // stylistic. Evaluated FRESH at every request send -- the initial
+  // request, every transport retry, and every salvage re-send all call this
+  // same function, so none of them can observe a stale tier decision from
+  // an earlier attempt. Selection: LONG (LONG_REQUEST_TIMEOUT_CAP_MS) iff
+  // the run is latched by cumulative ingested bytes (ctx.budget.bytes is
+  // monotone -- tools only add, salvage prunes messages, never this
+  // counter, so this is a latch with no eligibility state to lose) OR the
+  // run has entered the final synthesis phase; otherwise SHORT
+  // (REQUEST_TIMEOUT_CAP_MS). Either way, the bound is RESIZED, never
+  // removed: the result is still clipped to remainingMs(), with the same
+  // Math.max(1, ...) timer floor unchanged at the dispatch site below.
+  const requestTimeoutMs = () => {
+    const allowance = (flags.inFinalPhase || ctx.budget.bytes >= LONG_RUN_INGEST_BYTES)
+      ? LONG_REQUEST_TIMEOUT_CAP_MS
+      : REQUEST_TIMEOUT_CAP_MS;
+    return Math.max(0, Math.min(allowance, remainingMs()));
   };
   // R9 final-phase retry state. retriesLaunched is the SHARED counter the
   // gate tests against SYNTHESIS_RETRIES; emptyFinalRetries/refusedFinalVolleys
@@ -999,6 +1054,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
       fileContentBytes,
       noFileContentRead: fileContentBytes === 0 && !anyListSucceeded,
       emptyFinalRetries, refusedFinalVolleys,
+      longAllowanceRequests: flags.longAllowanceRequests,
     };
   }
 
@@ -1022,6 +1078,15 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     };
     let controller = null, timer = null;
     const timeoutMs = requestTimeoutMs();
+    // R11 -- the counter records HELD allowance, not eligibility: only when
+    // the effective (already clipped to remainingMs()) timeout exceeded the
+    // SHORT cap. A LONG-selected request clipped down to <=120s by a low
+    // clock does not count; a transport retry that again holds >120s counts
+    // again. Incremented exactly once per send, here at the dispatch site --
+    // never inside requestTimeoutMs() itself, which is a pure computation
+    // that must stay side-effect-free since nothing guarantees it is called
+    // exactly once per attempt.
+    if (timeoutMs > REQUEST_TIMEOUT_CAP_MS) flags.longAllowanceRequests++;
     if (typeof AbortController === "function") {
       controller = new AbortController();
       init.signal = controller.signal;
@@ -1274,6 +1339,11 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   // withTools=true -- R9's whole point: keep tools on the synthesis turn, so
   // a tool call emitted there can be REFUSED instead of silently dropped.
   async function runFinalPhase(initialMessage, initialFinishReason, isExhaustionEntry) {
+    // R11: the ONLY place flags.inFinalPhase is set, covering BOTH entries
+    // (E and N) in one line, since this single function serves both --
+    // requestTimeoutMs() must never infer final phase from withTools, which
+    // is true on every exploration request too.
+    flags.inFinalPhase = true;
     let message = initialMessage;
     let finishReason = initialFinishReason;
 
@@ -1552,6 +1622,26 @@ function formatCaps(caps, reviewed) {
     "  synthesis retries: " + (caps.emptyFinalRetries + caps.refusedFinalVolleys) + "/" + SYNTHESIS_RETRIES +
       "   empty final " + caps.emptyFinalRetries +
       "   refused tool-call volleys " + caps.refusedFinalVolleys,
+    // Printed UNCONDITIONALLY too, and for the same reason as the line above:
+    // a pasted cap report has to tell "no request needed the long allowance"
+    // apart from "this copy has no long allowance in it at all", and those
+    // are the two readings a suppressed zero would merge.
+    //
+    // What it counts is deliberately narrow, and the wording says so: a
+    // request is counted when its EFFECTIVE per-request timeout -- after the
+    // clip to the run's remaining wall clock -- came out above the short cap.
+    // Selecting the long tier is not enough. A long-tier request sent late
+    // enough that the clip pulled it back to 120s or less is absent from this
+    // count, which is the honest reading: it did not get the longer budget,
+    // whatever tier it asked for. A transport retry that again clears the
+    // short cap is counted again, because it really did hold that budget
+    // twice. A SHORT request can never reach this count -- min(120000, ...)
+    // is never above 120000 -- so the number is exactly how often the longer
+    // budget was in force, and a LOWER BOUND on how often the long tier was
+    // selected. Those two are the same only on a run with clock to spare.
+    "  long-allowance requests: " + caps.longAllowanceRequests +
+      "   (an effective per-request timeout above " + (REQUEST_TIMEOUT_CAP_MS / 1000) +
+      "s; the long ceiling is " + (LONG_REQUEST_TIMEOUT_CAP_MS / 1000) + "s)",
   ];
   if (caps.noFileContentRead && reviewed) {
     lines.push("  NO FILE CONTENT READ -- informational, not a verdict: a document that makes no");
