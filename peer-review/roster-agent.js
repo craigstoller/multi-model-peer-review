@@ -531,15 +531,48 @@ const MAX_TOOL_CALLS_PER_ITER = 8;      // tool_calls serviced per assistant mes
 // moves only to fix the 600s-vs-570s deadline incoherence, not to grant more
 // wall-clock budget.
 const WALL_CLOCK_MS = 555 * 1000;       // whole-run budget
-const REQUEST_TIMEOUT_CAP_MS = 120 * 1000; // per-HTTP-request ceiling (SHORT allowance)
-// R11: the LONG allowance for a request evaluated fresh at send time as
-// either (a) latched by cumulative ingested bytes, or (b) in the final
-// (synthesis) phase -- see requestTimeoutMs() below, which is the sole
-// place selection happens. Every request still passes through
-// min(allowance, remainingMs()) with the same Math.max(1, ...) timer floor
-// as before: the bound is RESIZED for these two cases, never removed.
-const LONG_REQUEST_TIMEOUT_CAP_MS = 480 * 1000; // per-HTTP-request ceiling (LONG allowance)
-const LONG_RUN_INGEST_BYTES = 256 * 1024;       // ctx.budget.bytes latch threshold for the LONG allowance
+// R12: ONE per-request ceiling, every send -- the sealed roster route's
+// working bound for a generation turn. This RETIRES R11's two-tier allowance
+// (a 120s SHORT cap latched up to a 480s LONG one by cumulative ingested
+// bytes, together with the two constants that expressed it, all deleted):
+// bytes ingested were never what decided whether a run could finish -- the
+// clock was -- so the tier machinery is replaced by the wall-clock reserve
+// below. The bound is still RESIZED, never removed: every send passes
+// through min(ceiling, budget) with the same Math.max(1, ...) timer floor at
+// the dispatch site.
+const REQUEST_TIMEOUT_CAP_MS = 480 * 1000; // per-HTTP-request ceiling, every send
+// R12: wall clock held back from EXPLORATION for the final (synthesis) phase.
+// A CLIP ON EXPLORATION, never a carve-out from synthesis -- a final-phase
+// send is clipped to remainingMs() alone, exactly as R11 left it. 555 - 300
+// leaves a 255s exploration window, so at t=0 every exploration send is
+// reserve-clipped and an exploration request can never hold the full
+// ceiling; a single exploration request needing more than 255s cannot
+// succeed on this route. That is the price of guaranteeing the one attempt
+// which can actually produce the review. Deliberately tunable: the per-phase
+// measurement below is the instrument (synthesis longest against the
+// reserve; exploration longest against the window).
+const SYNTHESIS_RESERVE_MS = 300 * 1000;
+// R12: the least EXPLORATION budget (remainingMs() - SYNTHESIS_RESERVE_MS)
+// any exploration send may launch with -- the initial send of an iteration
+// (the loop-top trigger), the transport retry, and the salvage re-send
+// alike. A doomed send costs a full prefill of the run's largest context for
+// nothing; this floor is what prevents it. R9's MIN_RETRY_BUDGET_MS (15s)
+// stays the FINAL phase's floor -- a retry there re-sends a conversation the
+// model has already answered once, and R9 sized it for that.
+const MIN_EXPLORATION_REQUEST_MS = 60 * 1000;
+// R12: the reporting threshold on the cap report's exploration line -- a
+// request slower than the pre-R12 cap, i.e. one the raise mattered for.
+// Part 4 renders the label ("over 120s") from this constant, never as a
+// literal.
+const SLOW_REQUEST_MS = 120 * 1000;
+// R12: the version of this script, bumped with every behavior change from
+// now on. The date of the SKILL.md version-line entry that ships it, with
+// ".2", ".3" ... appended when a second behavior change ships the same day.
+// This value is the SHIP DATE, deliberately set, never a placeholder: the
+// cap report prints it as its FIRST line, so a pasted report names exactly
+// which copy of this script produced it -- and it must equal the first date
+// on that version-line entry, which is asserted before release.
+const ROSTER_AGENT_VERSION = "2026-09-02";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -827,7 +860,16 @@ function emptyCaps() {
     contextLengthSalvageAttempted: false, contextLengthSalvageSucceeded: false, evidenceDiscarded: false,
     fileContentBytes: 0, noFileContentRead: true,
     emptyFinalRetries: 0, refusedFinalVolleys: 0,
-    longAllowanceRequests: 0,
+    // R12 -- the per-phase measurement fields, at their "nothing happened"
+    // values. The two ...LongestMs fields are NULL, never 0: null means "no
+    // request in that phase completed, so there is no measurement," while 0
+    // IS a measurement (a request that took no time). Part 4 renders a null
+    // as "n/a". longAllowanceRequests is GONE, not zeroed -- R11's counter
+    // measured a tier that no longer exists.
+    explorationRequests: 0, explorationLongestMs: null, explorationSlowRequests: 0,
+    synthesisEntry: null, synthesisEntryRemainingMs: null,
+    synthesisRequests: 0, synthesisLongestMs: null,
+    explorationFailure: null,
   };
 }
 
@@ -993,35 +1035,58 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     // N -- runFinalPhase is the single function serving both), and never
     // cleared. It is the ONLY final-phase signal requestTimeoutMs() below
     // may read -- NEVER inferred from withTools, which is true on every
-    // exploration request too. longAllowanceRequests lives here (not a
-    // separate module-level counter) so computeCaps() below can see it the
-    // same way it sees iterationsCapHit and friends; it is incremented once
-    // per HTTP send, at the dispatch site in singleRequest, never inside
-    // requestTimeoutMs() itself (a pure getter that may be evaluated more
-    // than once per attempt).
-    inFinalPhase: false, longAllowanceRequests: 0,
+    // exploration request too. R12 gives it three more readers, all keyed on
+    // the same signal: the transport-retry gate, the salvage re-send gate,
+    // and the per-phase measurement below.
+    inFinalPhase: false,
+    // R12 -- per-phase measurement, all written in ONE place (recordRequest
+    // below, called from singleRequest's finally) so a send can never be
+    // counted twice or missed. The ...LongestMs fields start null: see
+    // emptyCaps above for why null is not 0.
+    explorationRequests: 0, explorationLongestMs: null, explorationSlowRequests: 0,
+    synthesisRequests: 0, synthesisLongestMs: null,
+    // R12 -- how the loop left exploration, attributed by the condition that
+    // ACTUALLY ended the loop (see the loop below for the evaluation order),
+    // and the reason string of an intact exploration failure that was handed
+    // over to the synthesis turn rather than ending the run.
+    synthesisEntry: null, synthesisEntryRemainingMs: null, explorationFailure: null,
   };
-  // R11 -- the request-timeout allowance selector. Defined here (not
-  // earlier, alongside remainingMs) because it reads ctx.budget.bytes and
-  // flags.inFinalPhase, both declared just above; see the comment at
-  // remainingMs's definition for why this placement is load-bearing, not
-  // stylistic. Evaluated FRESH at every request send -- the initial
-  // request, every transport retry, and every salvage re-send all call this
-  // same function, so none of them can observe a stale tier decision from
-  // an earlier attempt. Selection: LONG (LONG_REQUEST_TIMEOUT_CAP_MS) iff
-  // the run is latched by cumulative ingested bytes (ctx.budget.bytes is
-  // monotone -- tools only add, salvage prunes messages, never this
-  // counter, so this is a latch with no eligibility state to lose) OR the
-  // run has entered the final synthesis phase; otherwise SHORT
-  // (REQUEST_TIMEOUT_CAP_MS). Either way, the bound is RESIZED, never
-  // removed: the result is still clipped to remainingMs(), with the same
-  // Math.max(1, ...) timer floor unchanged at the dispatch site below.
+  // R12 -- the EXPLORATION budget: the wall clock an exploration send may
+  // spend without eating into the reserve the synthesis turn is owed. The
+  // single expression three separate decisions read (the clip below, the
+  // transport-retry gate, and the salvage re-send gate), so they cannot
+  // drift apart. Can go negative past the reserve; every caller either
+  // compares it against the floor or clamps it.
+  const explorationBudgetMs = () => remainingMs() - SYNTHESIS_RESERVE_MS;
+  // R12 -- the per-request bound. Defined here (not earlier, alongside
+  // remainingMs) because it reads flags.inFinalPhase, declared just above;
+  // see the comment at remainingMs's definition for why this placement is
+  // load-bearing, not stylistic. Evaluated FRESH at every request send --
+  // the initial request, every transport retry, and every salvage re-send
+  // call this same function, so none can observe a stale decision from an
+  // earlier attempt.
+  //
+  // ONE ceiling, two budgets. An EXPLORATION send is clipped by the
+  // exploration budget (the remainder minus the reserve); a FINAL-PHASE send
+  // is clipped by the bare remainder, exactly as R11 left it -- the reserve
+  // is a clip on exploration, never a carve-out from synthesis. The phase is
+  // read from flags.inFinalPhase and NEVER inferred from withTools, which is
+  // true on every exploration request too. Either way the bound is RESIZED,
+  // never removed: the same Math.max(1, ...) timer floor is unchanged at the
+  // dispatch site below.
   const requestTimeoutMs = () => {
-    const allowance = (flags.inFinalPhase || ctx.budget.bytes >= LONG_RUN_INGEST_BYTES)
-      ? LONG_REQUEST_TIMEOUT_CAP_MS
-      : REQUEST_TIMEOUT_CAP_MS;
-    return Math.max(0, Math.min(allowance, remainingMs()));
+    const budget = flags.inFinalPhase ? remainingMs() : explorationBudgetMs();
+    return Math.max(0, Math.min(REQUEST_TIMEOUT_CAP_MS, budget));
   };
+  // R12 -- "may an exploration send launch at all?" The floor is what stops
+  // a doomed send from spending a full prefill of the run's largest context
+  // for nothing. Two callers, both RETRY-shaped decisions taken after a
+  // failure: the transport-retry gate and the salvage re-send gate. The
+  // loop-top reserve trigger asks the same question but is written out in
+  // full at its own site, in the contract's own words -- it is the condition
+  // that ATTRIBUTES an entry, and collapsing it into this helper would make
+  // the attribution and the gates one mutation point instead of three.
+  const explorationSendAffordable = () => explorationBudgetMs() >= MIN_EXPLORATION_REQUEST_MS;
   // R9 final-phase retry state. retriesLaunched is the SHARED counter the
   // gate tests against SYNTHESIS_RETRIES; emptyFinalRetries/refusedFinalVolleys
   // are the per-CAUSE counters reported in caps (their sum equals
@@ -1054,8 +1119,37 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
       fileContentBytes,
       noFileContentRead: fileContentBytes === 0 && !anyListSucceeded,
       emptyFinalRetries, refusedFinalVolleys,
-      longAllowanceRequests: flags.longAllowanceRequests,
+      // R12 -- the two measurement lines and the entry attribution. Mirrors
+      // emptyCaps() above field for field; longAllowanceRequests is absent
+      // from BOTH, deliberately (gone, not zeroed).
+      explorationRequests: flags.explorationRequests,
+      explorationLongestMs: flags.explorationLongestMs,
+      explorationSlowRequests: flags.explorationSlowRequests,
+      synthesisEntry: flags.synthesisEntry,
+      synthesisEntryRemainingMs: flags.synthesisEntryRemainingMs,
+      synthesisRequests: flags.synthesisRequests,
+      synthesisLongestMs: flags.synthesisLongestMs,
+      explorationFailure: flags.explorationFailure,
     };
+  }
+
+  // R12 -- the ONE writer of the measurement counters, called from
+  // singleRequest's `finally` so an abort, a throw and a malformed body are
+  // all measured, exactly like a success. `wasFinalPhase` is captured at the
+  // SEND, not read here, so a request that straddles the phase switch (there
+  // is no such request today, but nothing structurally prevents one) is
+  // attributed to the phase it was actually sent in. One singleRequest
+  // invocation is one request: each transport attempt and each salvage
+  // re-send counts separately, in both phases.
+  function recordRequest(wasFinalPhase, elapsedMs) {
+    if (wasFinalPhase) {
+      flags.synthesisRequests++;
+      flags.synthesisLongestMs = flags.synthesisLongestMs === null ? elapsedMs : Math.max(flags.synthesisLongestMs, elapsedMs);
+      return;
+    }
+    flags.explorationRequests++;
+    flags.explorationLongestMs = flags.explorationLongestMs === null ? elapsedMs : Math.max(flags.explorationLongestMs, elapsedMs);
+    if (elapsedMs > SLOW_REQUEST_MS) flags.explorationSlowRequests++;
   }
 
   function finalizeIncomplete(reason) {
@@ -1064,8 +1158,18 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
 
   // --- One HTTP call, with a per-request timeout and one transport-level
   // retry (network throw or our own abort-on-timeout). Returns
-  // {ok:true, message} | {contextLengthError:true} | {ok:false, reason}.
-  // Never throws -- every failure mode is normalized into one of those. ---
+  // {ok:true, message} | {contextLengthError:true} | {transportError:true,
+  // error} | {ok:false, reason, evidenceIntact}. Never throws -- every
+  // failure mode is normalized into one of those.
+  //
+  // R12 -- EVERY {ok:false} in this file carries `evidenceIntact`. It is
+  // false IFF dropAllToolExchanges ran in producing the result, which
+  // happens in exactly one place (requestWithContextSalvage's SECOND
+  // context-length branch); it is true everywhere else. The exploration loop
+  // routes on this field and never on the reason strings: an intact failure
+  // hands the run over to the synthesis turn, a not-intact one ends it,
+  // because a review whose evidence was all discarded must never be reported
+  // as grounded. ---
   async function singleRequest(withTools) {
     const payload = { model, max_tokens: MAX_TOKENS, messages, ...(withTools ? { tools: TOOL_SCHEMAS } : {}) };
     // FIREWORKS_API_KEY is read here only to build this header; it is never
@@ -1078,66 +1182,111 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     };
     let controller = null, timer = null;
     const timeoutMs = requestTimeoutMs();
-    // R11 -- the counter records HELD allowance, not eligibility: only when
-    // the effective (already clipped to remainingMs()) timeout exceeded the
-    // SHORT cap. A LONG-selected request clipped down to <=120s by a low
-    // clock does not count; a transport retry that again holds >120s counts
-    // again. Incremented exactly once per send, here at the dispatch site --
-    // never inside requestTimeoutMs() itself, which is a pure computation
-    // that must stay side-effect-free since nothing guarantees it is called
-    // exactly once per attempt.
-    if (timeoutMs > REQUEST_TIMEOUT_CAP_MS) flags.longAllowanceRequests++;
+    // R12 -- the phase is captured HERE, at the send, and carried into the
+    // measurement below; see recordRequest's comment.
+    const sentInFinalPhase = flags.inFinalPhase;
     if (typeof AbortController === "function") {
       controller = new AbortController();
       init.signal = controller.signal;
       timer = scheduleTimeout(() => controller.abort(), Math.max(1, timeoutMs));
     }
-    let res;
+    // R12 -- THE PER-REQUEST BOUND COVERS THE BODY. res.json() is awaited
+    // inside the SAME try as doFetch, and the timer is cancelled in a
+    // `finally` after BOTH. Cancelling at headers (what pre-R12 code did)
+    // left the body read unbounded: a provider that sends headers promptly
+    // and then streams a generation turn for minutes was outside the bound
+    // entirely -- the whole reason the deadline could be blown with no timer
+    // ever firing. Tool execution stays outside this bound by design: it is
+    // local, already bounded by the read/byte/entry caps, and is caught by
+    // the loop-top check rather than by a second timer.
+    //
+    // t0 is on clockNow() -- the INJECTED clock, the same one the clip and
+    // the abort timer are computed from -- never Date.now() directly, so the
+    // fast suite drives elapsed deterministically and a divergence between
+    // the two clocks cannot hide until the real-time e2e run.
+    const t0 = clockNow();
+    let res = null, body;
     try {
       res = await doFetch(FIREWORKS_URL, init);
+      body = await res.json();
     } catch (e) {
-      return { transportError: true, error: e };
+      // A fetch throw is a transport failure, as before. A BODY read that
+      // rejects is one too when it rejects because the bound fired -- either
+      // our own controller says so, or the error names itself AbortError
+      // (what a real fetch implementation rejects the body promise with).
+      // Any OTHER body-read failure is a genuinely non-JSON body and keeps
+      // its byte-stable malformed-response reason.
+      if (res === null) return { transportError: true, error: e };
+      if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError")) {
+        return { transportError: true, error: e };
+      }
+      return { ok: false, reason: `malformed-response: non-JSON body (HTTP ${res.status}): ${e.message}`, evidenceIntact: true };
     } finally {
       if (timer) cancelTimeout(timer);
+      recordRequest(sentInFinalPhase, clockNow() - t0);
     }
-    let body;
-    try { body = await res.json(); }
-    catch (e) { return { ok: false, reason: `malformed-response: non-JSON body (HTTP ${res.status}): ${e.message}` }; }
 
     if (!res.ok) {
       const errObj = body && body.error;
       const isContextLength = !!errObj && (errObj.code === "context_length_exceeded" || /context length/i.test(String(errObj.message || "")));
       if (isContextLength) return { contextLengthError: true, status: res.status };
-      return { ok: false, reason: `http-error: HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}` };
+      return { ok: false, reason: `http-error: HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}`, evidenceIntact: true };
     }
     const choice = body && Array.isArray(body.choices) && body.choices[0];
     const message = choice && choice.message;
     if (!message || typeof message !== "object") {
-      return { ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})` };
+      return { ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})`, evidenceIntact: true };
     }
     return { ok: true, message, finishReason: choice.finish_reason };
   }
 
+  // R12 -- the retry gate is PHASE-AWARE, reading flags.inFinalPhase, the
+  // same signal as the clip. In the FINAL phase the rule is unchanged from
+  // R9/R11 (`remainingMs() <= 0` refuses, with its byte-stable text). In
+  // EXPLORATION the floor applies instead: a retry that would launch with
+  // less than MIN_EXPLORATION_REQUEST_MS of exploration budget is refused,
+  // with its own text naming the exploration clock. A string that names the
+  // exploration clock is never produced in the final phase, and vice versa.
   async function requestWithTransportRetry(withTools) {
     let r = await singleRequest(withTools);
     if (r.transportError) {
-      if (remainingMs() <= 0) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (no wall-clock time left to retry)` };
+      if (flags.inFinalPhase) {
+        if (remainingMs() <= 0) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (no wall-clock time left to retry)`, evidenceIntact: true };
+      } else if (!explorationSendAffordable()) {
+        return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (no exploration time left to retry)`, evidenceIntact: true };
+      }
       r = await singleRequest(withTools);
-      if (r.transportError) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (after one retry)` };
+      if (r.transportError) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (after one retry)`, evidenceIntact: true };
     }
     return r;
   }
 
   // Context-length salvage. Distinct from loop/wall-clock exhaustion by
   // design (see dropAllToolExchanges above): the FIRST failure drops only
-  // the oldest tool exchange and retries once; a SECOND failure (of any
-  // kind) drops everything and the run is marked incomplete, because a
-  // review whose evidence was discarded must never be reported as grounded.
+  // the oldest tool exchange and re-sends once.
   // `flags.evidenceDiscarded` is set true the moment a drop actually
-  // removes something -- regardless of whether the retry afterward
+  // removes something -- regardless of whether the re-send afterward
   // succeeds -- because evidence was genuinely discarded from the
-  // conversation either way; only `status` differs (ok if the retry
-  // recovers, incomplete if it does not).
+  // conversation either way; only `status` differs.
+  //
+  // R12 revises this at exactly two points; the drop logic itself is
+  // untouched.
+  //
+  // (1) The re-send launches only if the PHASE'S FLOOR is met. A re-send
+  // that cannot fit is the same doomed full prefill the exploration floor
+  // exists to prevent, and returning without sending leaves the run with the
+  // one exchange already dropped and reported.
+  //
+  // (2) R8's evidence contract is NARROWED to what it was for. Only a SECOND
+  // CONTEXT-LENGTH failure sheds all evidence and ends the run: that is the
+  // case where the conversation genuinely cannot be made to fit, and a
+  // review written from it must never be reported as grounded. A re-send
+  // that fails for any OTHER reason (transport, http-error, malformed) says
+  // nothing about the conversation's size -- it is returned untouched, with
+  // its own evidenceIntact:true, so the loop hands over to the synthesis
+  // turn with the evidence the first drop left. Pre-R12 code dropped
+  // everything on a second failure "of any kind," which threw away a whole
+  // run's evidence over one flaky socket.
   async function requestWithContextSalvage(withTools) {
     const attempt = await requestWithTransportRetry(withTools);
     if (!attempt.contextLengthError) return attempt;
@@ -1145,17 +1294,41 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     flags.contextLengthSalvageAttempted = true;
     const dropped = dropOldestToolExchange(messages, survivingById);
     if (!dropped) {
-      return { ok: false, reason: "context-length-exceeded: no accumulated tool results existed to drop; the run has no evidence to salvage" };
+      // Nothing was dropped, so the evidence is intact by definition.
+      return { ok: false, reason: "context-length-exceeded: no accumulated tool results existed to drop; the run has no evidence to salvage", evidenceIntact: true };
     }
     flags.evidenceDiscarded = true;
+    // R12 revision (1) -- the phase's floor, phrased in that phase's own
+    // words. Exploration must clear MIN_EXPLORATION_REQUEST_MS of
+    // EXPLORATION budget; the final phase keeps R9's MIN_RETRY_BUDGET_MS
+    // against the bare remainder.
+    if (flags.inFinalPhase) {
+      if (remainingMs() < MIN_RETRY_BUDGET_MS) {
+        return { ok: false, reason: "context-length-exceeded: the oldest tool results were dropped and no wall-clock time remained for the re-send", evidenceIntact: true };
+      }
+    } else if (!explorationSendAffordable()) {
+      return { ok: false, reason: "context-length-exceeded: the oldest tool results were dropped and no exploration time remained for the re-send", evidenceIntact: true };
+    }
     const retry = await requestWithTransportRetry(withTools);
     if (retry.ok) { flags.contextLengthSalvageSucceeded = true; return retry; }
+    // R12 revision (2) -- anything other than a second context-length
+    // failure passes through untouched, evidenceIntact included. Nothing
+    // further is dropped.
+    if (!retry.contextLengthError) return retry;
 
     dropAllToolExchanges(messages, survivingById);
+    // The ternary's second arm is now UNREACHABLE: a non-context-length
+    // re-send failure returns above, so retry.contextLengthError is always
+    // true here. The "the retry failed again after context-length salvage"
+    // template is left in place, byte-identical, rather than deleted --
+    // deleting it would be an invisible change to a reason string that has
+    // shipped, and keeping the ternary keeps the shape of the decision
+    // visible next to the narrowing that made one arm dead.
     const why = retry.contextLengthError
       ? "context length exceeded again after dropping the oldest tool results"
       : (retry.reason || "the retry failed again after context-length salvage");
-    return { ok: false, reason: `context-length-exceeded: ${why}; all tool-result evidence has been discarded from the conversation` };
+    // The ONE not-intact result in the program.
+    return { ok: false, reason: `context-length-exceeded: ${why}; all tool-result evidence has been discarded from the conversation`, evidenceIntact: false };
   }
 
   // --- Service tool_calls: first MAX_TOOL_CALLS_PER_ITER through the tools,
@@ -1344,12 +1517,35 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     // requestTimeoutMs() must never infer final phase from withTools, which
     // is true on every exploration request too.
     flags.inFinalPhase = true;
+    // R12 -- recorded ONCE, here, before the guard below, so the cap report
+    // can say how much clock the synthesis turn was actually handed however
+    // the run got here (including the case where the answer is "none," which
+    // the guard is about to act on). Clamped at 0: a negative remainder is a
+    // clock that already blew past the deadline, and reporting it as a
+    // negative "remaining" would be nonsense.
+    flags.synthesisEntryRemainingMs = Math.max(0, remainingMs());
     let message = initialMessage;
     let finishReason = initialFinishReason;
 
     if (isExhaustionEntry) {
       // Pre-request guard, mirrored at the gate via MIN_RETRY_BUDGET_MS: on
       // a spent clock, no request launches at all.
+      //
+      // R12 -- this guard is now DEFENCE IN DEPTH on every path. Through the
+      // REQUEST path it is unreachable: the reserve trigger hands over with
+      // ABOUT the reserve in hand -- a fully-clipped exploration send leaves
+      // exactly SYNTHESIS_RESERVE_MS, and local tool servicing then spends
+      // from it, so "at least" would overstate it -- and the iteration bound
+      // cannot leave much less either (the clip guarantees the send side),
+      // so no send that merely ran long arrives here on a spent clock. What
+      // does is a CLOCK JUMP -- a suspended machine, a stalled local tool --
+      // carrying the clock past the deadline BETWEEN sends, and it reaches
+      // this guard from EITHER entry: an exploration failure whose send
+      // bumped past the deadline, or a tool-call reply that bumped past it
+      // before the next loop-top check (attributed `reserve`, since that is
+      // the condition which actually ended the loop). Both are pinned by
+      // tests. Consumers of wallClockCapHit must not assume one
+      // synthesisEntry value.
       if (remainingMs() <= 0) {
         flags.wallClockCapHit = true;
         return finalizeIncomplete("loop budget exhausted with no wall-clock time remaining for a synthesis turn");
@@ -1475,19 +1671,53 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   }
 
   // --- The loop. ---
+  //
+  // R12 -- exploration ends for exactly four reasons, and each ATTRIBUTES the
+  // synthesis entry by the condition that ACTUALLY ended the loop. The
+  // evaluation order below is the precedence, and it is load-bearing:
+  //
+  //   1. An exploration FAILURE ends the loop the moment it happens. An
+  //      intact one (evidenceIntact) records its reason and hands over to
+  //      the synthesis turn -- the run still writes a review, from whatever
+  //      evidence survived, which R8's reporting describes honestly. A
+  //      not-intact one (all evidence discarded) ends the run, unchanged.
+  //   2. The `for` bound: the twelfth serviced volley ends the loop HERE,
+  //      before any loop-top check can run again, so a run whose clock also
+  //      fell below the reserve during that twelfth turn is attributed
+  //      `iterations`, never `reserve`. A test pins this precedence.
+  //   3. The RESERVE, at the loop top, before a send: less than one
+  //      realistic exploration request of budget remains. This replaces the
+  //      bare `remainingMs() <= 0` break, which it subsumes -- and it is
+  //      what keeps a send that merely ran long from ever reaching E-entry's
+  //      own guard. A clock JUMP between sends still reaches that guard from
+  //      here, entry attributed `reserve`; see the guard's own comment.
+  //   4. A natural reply (no tool calls) -> phase N, whatever the clock
+  //      says: the reply IS the candidate, and R9 classifies it.
   let finalMessage = null;
   let finalFinishReason = null;
   for (let iter = 1; iter <= MAX_ITERATIONS; iter++) {
-    if (remainingMs() <= 0) break;
+    if (remainingMs() < SYNTHESIS_RESERVE_MS + MIN_EXPLORATION_REQUEST_MS) {
+      flags.synthesisEntry = "reserve";
+      break;
+    }
     const result = await requestWithContextSalvage(true);
-    if (!result.ok) return finalizeIncomplete(result.reason);
+    if (!result.ok) {
+      if (!result.evidenceIntact) return finalizeIncomplete(result.reason);
+      flags.explorationFailure = result.reason;
+      flags.synthesisEntry = "exploration-failure";
+      break;
+    }
     if (hasToolCalls(result.message)) {
       recordAssistantAndServiceTools(result.message);
-      if (iter === MAX_ITERATIONS) flags.iterationsCapHit = true;
+      if (iter === MAX_ITERATIONS) {
+        flags.iterationsCapHit = true;
+        flags.synthesisEntry = "iterations";
+      }
       continue;
     }
     finalMessage = result.message;
     finalFinishReason = result.finishReason;
+    flags.synthesisEntry = "natural";
     break;
   }
 
@@ -1596,6 +1826,50 @@ function formatTrace(trace, reviewed) {
   }).join("\n");
 }
 
+// ONE sanitizer for the provider error text that can land inside the
+// synthesis line's `exploration failure -- <reason>` phrase. That reason
+// arrives verbatim from the wire (an http-error carries 300 bytes of the
+// response body; a transport failure carries whatever the runtime threw), so
+// an embedded newline or control byte would break the cap report's
+// one-fact-per-line shape and could smear a forged extra line into a pasted
+// report. Every RUN of control characters collapses to a single space --
+// written as an explicit scan rather than a regex character class so no
+// control byte has to appear in this file's own source -- and the result goes
+// through the SAME clip() the trace uses, at 200.
+function sanitizeReason(reason) {
+  if (typeof reason !== "string") return String(reason);
+  let out = "", lastWasControl = false;
+  for (const ch of reason) {
+    const code = ch.codePointAt(0);
+    if (code < 32 || code === 127) {
+      if (!lastWasControl) out += " ";
+      lastWasControl = true;
+      continue;
+    }
+    lastWasControl = false;
+    out += ch;
+  }
+  return clip(out, 200);
+}
+
+// A millisecond measurement rendered as seconds to one decimal. `null` means
+// "no request in that phase completed, so there is no measurement" -- which
+// is NOT a measurement of zero, and must not read as one, so it renders n/a.
+function formatSeconds(ms) {
+  return typeof ms === "number" ? (ms / 1000).toFixed(1) + "s" : "n/a";
+}
+
+// The synthesis line's entry phrase: WHICH of the four conditions actually
+// ended the exploration loop. The labels are rendered from the constants they
+// name, never as literals, so a tuned constant cannot leave the report
+// describing a bound the script no longer has.
+function describeSynthesisEntry(caps) {
+  if (caps.synthesisEntry === "natural") return "naturally";
+  if (caps.synthesisEntry === "iterations") return "on loop iterations (" + MAX_ITERATIONS + ")";
+  if (caps.synthesisEntry === "reserve") return "on wall-clock reserve (" + (SYNTHESIS_RESERVE_MS / 1000) + "s)";
+  return "on exploration failure -- " + sanitizeReason(caps.explorationFailure);
+}
+
 function formatCaps(caps, reviewed) {
   const hit = [];
   if (caps.readsCapHit) hit.push("file reads (" + READS_CAP + ")");
@@ -1603,8 +1877,13 @@ function formatCaps(caps, reviewed) {
   if (caps.toolCallsPerIterationCapHit) hit.push("tool calls in one message (" + MAX_TOOL_CALLS_PER_ITER + ")");
   if (caps.pathRefusalCapHit) hit.push("same path refused " + PATH_REFUSAL_LIMIT + " times");
   if (caps.iterationsCapHit) hit.push("loop iterations (" + MAX_ITERATIONS + ")");
-  if (caps.wallClockCapHit) hit.push("wall clock (" + (WALL_CLOCK_MS / 60000) + " min)");
+  if (caps.wallClockCapHit) hit.push("wall clock (" + (WALL_CLOCK_MS / 1000) + "s)");
   const lines = [
+    // FIRST line of the cap report, unconditionally. A pasted report is the
+    // only artifact a field observation ever carries, and until this line
+    // existed the only way to tell which copy of this script produced one was
+    // to look for a line that did not exist at the version being blamed.
+    "  roster-agent version: " + ROSTER_AGENT_VERSION,
     "  reads " + caps.reads + "/" + READS_CAP +
       "   bytes returned " + caps.bytes + "/" + TOTAL_BYTES_CAP +
       "   of which file content " + caps.fileContentBytes +
@@ -1622,26 +1901,36 @@ function formatCaps(caps, reviewed) {
     "  synthesis retries: " + (caps.emptyFinalRetries + caps.refusedFinalVolleys) + "/" + SYNTHESIS_RETRIES +
       "   empty final " + caps.emptyFinalRetries +
       "   refused tool-call volleys " + caps.refusedFinalVolleys,
-    // Printed UNCONDITIONALLY too, and for the same reason as the line above:
-    // a pasted cap report has to tell "no request needed the long allowance"
-    // apart from "this copy has no long allowance in it at all", and those
-    // are the two readings a suppressed zero would merge.
+    // The two per-phase measurement lines, both printed UNCONDITIONALLY and
+    // for the same reason as the lines above: a pasted cap report has to tell
+    // "nothing happened in that phase" apart from "this copy does not measure
+    // that phase at all", and those are the two readings a suppressed zero
+    // would merge. They replace the retired two-tier counter, which measured a
+    // tier that no longer exists.
     //
-    // What it counts is deliberately narrow, and the wording says so: a
-    // request is counted when its EFFECTIVE per-request timeout -- after the
-    // clip to the run's remaining wall clock -- came out above the short cap.
-    // Selecting the long tier is not enough. A long-tier request sent late
-    // enough that the clip pulled it back to 120s or less is absent from this
-    // count, which is the honest reading: it did not get the longer budget,
-    // whatever tier it asked for. A transport retry that again clears the
-    // short cap is counted again, because it really did hold that budget
-    // twice. A SHORT request can never reach this count -- min(120000, ...)
-    // is never above 120000 -- so the number is exactly how often the longer
-    // budget was in force, and a LOWER BOUND on how often the long tier was
-    // selected. Those two are the same only on a run with clock to spare.
-    "  long-allowance requests: " + caps.longAllowanceRequests +
-      "   (an effective per-request timeout above " + (REQUEST_TIMEOUT_CAP_MS / 1000) +
-      "s; the long ceiling is " + (LONG_REQUEST_TIMEOUT_CAP_MS / 1000) + "s)",
+    // Read them as the instrument for the two numbers that are deliberately
+    // tunable. `over Ns` is how often a request outran the pre-existing bound,
+    // i.e. how often raising the ceiling mattered at all. `longest` on the
+    // exploration line, against the window the reserve leaves, is what the
+    // reserve COSTS; `longest` on the synthesis line, against the reserve, is
+    // whether the reserve is ENOUGH. Both counts are physical sends: a
+    // transport retry and a salvage re-send each count once more, because each
+    // really did spend that budget.
+    "  exploration: " + caps.explorationRequests + " requests" +
+      "   longest " + formatSeconds(caps.explorationLongestMs) +
+      "   over " + (SLOW_REQUEST_MS / 1000) + "s: " + caps.explorationSlowRequests +
+      "   (ceiling " + (REQUEST_TIMEOUT_CAP_MS / 1000) + "s, clipped to keep the " +
+      (SYNTHESIS_RESERVE_MS / 1000) + "s synthesis reserve)",
+    // `not reached` is the whole line when the run ended inside exploration
+    // and no synthesis turn was ever entered -- distinct from entering one and
+    // sending nothing, which reads `requests 0` and means the pre-request
+    // guard found no clock.
+    caps.synthesisEntry === null
+      ? "  synthesis: not reached"
+      : "  synthesis: entered " + describeSynthesisEntry(caps) +
+        " with " + formatSeconds(caps.synthesisEntryRemainingMs) + " remaining" +
+        "   requests " + caps.synthesisRequests +
+        "   longest " + formatSeconds(caps.synthesisLongestMs),
   ];
   if (caps.noFileContentRead && reviewed) {
     lines.push("  NO FILE CONTENT READ -- informational, not a verdict: a document that makes no");
