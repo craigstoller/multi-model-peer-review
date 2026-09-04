@@ -63,7 +63,49 @@ function realOrNull(p) {
   try { return fs.realpathSync(fromMsys(p)); } catch { return null; }
 }
 
-// The ONE security rule. Both sides realpath'd by the caller/here; exact compare.
+// How far above a candidate the component walk below will look for the root.
+// The walk terminates on its own -- `parent === p` at a filesystem root ends
+// it for any input -- so this is a DEPTH CAP, not a termination guard: a
+// candidate that has not met the root within 64 components is refused rather
+// than walked further, which is the fail-closed answer. A missing path 65
+// components deep inside a repository is not a shape a review produces.
+const MAX_ANCESTOR_WALK = 64;
+
+// The leaf probe: {real} on success, {code} on failure (the errno-style code,
+// or Node's ERR_* code for an invalid argument such as a NUL byte). Reporting
+// the code rather than a bare null is the whole point -- it is what lets
+// resolveInRepo tell genuine absence apart from every other reason a path
+// fails to resolve. Never throws.
+function realOrCode(p) {
+  try { return { real: fs.realpathSync(fromMsys(p)) }; }
+  catch (e) { return { code: (e && e.code) ? String(e.code) : "UNKNOWN" }; }
+}
+// Same fromMsys as realOrCode, so the two helpers accept the same forms --
+// the walk is only ever called with the already-normalized `abs`, but the
+// symmetry costs nothing and removes an invariant a future caller could
+// break.
+function lstatOrCode(p) {
+  try { return { stat: fs.lstatSync(fromMsys(p)) }; }
+  catch (e) { return { code: (e && e.code) ? String(e.code) : "UNKNOWN" }; }
+}
+// The absence codes. ENOTDIR is "a component is a file, not a directory",
+// which POSIX reports for sub/in.txt/nope; Windows reports ENOENT for the
+// same shape. Both mean no object exists at that pathname.
+function isAbsenceCode(code) { return code === "ENOENT" || code === "ENOTDIR"; }
+
+// The ONE security rule. Two kinds of call site, both an exact-string compare,
+// but the left operand is realpath'd at only ONE of them:
+//   - real vs real: on the branch where the candidate resolved, `resolved` is
+//     a realpath and so is `rootReal`, so no link can smuggle a path back in.
+//   - lexical vs real: the check hoisted ahead of the leaf probe passes `abs`,
+//     a purely lexical path.resolve result that has never touched the
+//     filesystem. There this is a SPELLING test, deliberately -- the gate
+//     accepts an in-repository path only in the root's own spelling, which is
+//     what keeps anything lexically outside from ever reaching a syscall.
+// Exact-string is right for both, and for the same reason: a case-mangled,
+// drive-mangled or extended-length spelling is refused rather than quietly
+// corrected, and "+ path.sep" stops "<root>-evil" from string-prefixing the
+// root. Never case-fold either side; never compare a bare prefix.
 function insideRoot(resolved, rootReal) {
   return resolved === rootReal || resolved.startsWith(rootReal + path.sep);
 }
@@ -92,21 +134,38 @@ function isBinary(file) {
 // not a contrived one), and any of the fs calls below can also throw for
 // reasons that have nothing to do with the security decision (an ACL-denied
 // in-repo file, a TOCTOU unlink between resolve and stat). Every such case
-// maps to "outside-repo" -- the same reasoning realOrNull's null case
-// already documents: a path this function cannot vouch for is not treated
-// as inside the repo, and reporting it that way avoids leaking whether the
-// path exists outside. `kind` is caller-controlled too (Tasks 3/4), not
+// maps to "outside-repo" -- the same reasoning the leaf probe (realOrCode) and
+// its non-absence branch already document: a path this function cannot vouch
+// for is not treated as inside the repo, and reporting it that way avoids
+// leaking whether the path exists outside. `kind` is caller-controlled too (Tasks 3/4), not
 // model-controlled, but an unrecognized value must still fail closed rather
 // than silently skip both the file/dir type check and the binary sniff.
 function resolveInRepo(candidate, rootReal, kind = "file") {
   try {
     if (typeof candidate !== "string") return { ok: false, reason: "outside-repo" };
     if (kind !== "file" && kind !== "dir") return { ok: false, reason: "outside-repo" };
+    // Normalized absolute form in BOTH branches (path.resolve normalizes
+    // `..` and separators for an absolute input too).
     const abs = path.isAbsolute(fromMsys(candidate))
-      ? fromMsys(candidate)
+      ? path.resolve(fromMsys(candidate))
       : path.resolve(rootReal, fromMsys(candidate));
-    const resolved = realOrNull(abs);
-    if (resolved === null) return { ok: false, reason: "outside-repo" };
+    // NEW, and FIRST: nothing lexically outside the root is ever handed to
+    // the filesystem. An outside path that would resolve INTO the root
+    // through a link is refused here -- the gate accepts in-repository
+    // paths in their in-repository spelling only, as it already does for
+    // extended-length forms.
+    if (!insideRoot(abs, rootReal)) return { ok: false, reason: "outside-repo" };
+    const leaf = realOrCode(abs);
+    if (leaf.code !== undefined) {
+      // NEW: the leaf did not resolve. Only genuine absence, reached
+      // through plain directories, can become not-found; every other
+      // failure -- and every link on the way, dangling or not -- is a
+      // path the gate cannot vouch for.
+      if (!isAbsenceCode(leaf.code)) return { ok: false, reason: "outside-repo" };
+      return { ok: false, reason: absentThroughPlainDirs(abs, rootReal) ? "not-found" : "outside-repo" };
+    }
+    const resolved = leaf.real;
+    // -- unchanged from here --
     if (!insideRoot(resolved, rootReal)) return { ok: false, reason: "outside-repo" };
     if (isGitSkip(resolved, rootReal)) return { ok: false, reason: "git-skip" };
     const st = fs.statSync(resolved);
@@ -117,6 +176,37 @@ function resolveInRepo(candidate, rootReal, kind = "file") {
   } catch {
     return { ok: false, reason: "outside-repo" };
   }
+}
+
+// True iff `abs` (already lexically inside rootReal) reaches its first
+// missing component through plain directories only. Enumerates the
+// components strictly below the root, top-down, with lstat -- which does
+// not follow its FINAL component and never reads a target; because the
+// walk is top-down, every component is the final one of its own call by
+// the time it is inspected, so the first link met ends the walk before
+// anything below it is touched. An existing component that is a symlink
+// or junction (lstat reports junctions as symbolic links) ends the walk
+// with false, WHETHER OR NOT its target exists, so the verdict can never
+// act as an existence oracle for anything outside. The first
+// absent component (ENOENT, or ENOTDIR when a file is used as a directory)
+// ends the walk with true: everything below it is absent too. Any other
+// error is false. Never above the root; bounded; fails closed.
+function absentThroughPlainDirs(abs, rootReal) {
+  const chain = [];                       // abs, parent(abs), ... down to just below rootReal
+  let p = abs;
+  for (let i = 0; i < MAX_ANCESTOR_WALK && p !== rootReal; i++) {
+    chain.push(p);
+    const parent = path.dirname(p);
+    if (parent === p) return false;       // walked off the top without meeting the root
+    p = parent;
+  }
+  if (p !== rootReal) return false;       // bound exhausted
+  for (let i = chain.length - 1; i >= 0; i--) {   // just below the root, downward
+    const r = lstatOrCode(chain[i]);
+    if (r.code !== undefined) return isAbsenceCode(r.code);
+    if (r.stat.isSymbolicLink()) return false;
+  }
+  return false;                           // every component exists: the leaf's realpath failure was not absence
 }
 
 // ===========================================================================
@@ -134,25 +224,25 @@ const LIST_ENTRIES_CAP = 200;          // directory entries per list_files call
 // ---------------------------------------------------------------------------
 // Error-reason namespaces. These are TWO SEPARATE vocabularies, not one list:
 //
-//   1. resolveInRepo's six reason strings (the confinement gate's interface):
-//      outside-repo, git-skip, not-a-file, not-a-directory, binary,
-//      unsupported-encoding. Tools pass these through unchanged when the
-//      gate itself refuses a path. (unsupported-encoding is reserved by the
+//   1. resolveInRepo's seven reason strings (the confinement gate's interface):
+//      outside-repo, not-found, git-skip, not-a-file, not-a-directory,
+//      binary, unsupported-encoding. Tools pass these through unchanged
+//      when the gate itself refuses a path. (unsupported-encoding is reserved by the
 //      gate for the tools to emit -- resolveInRepo never returns it
 //      itself; readFile below is what actually emits it, on a BOM that
 //      names an unhandled encoding or content that fails strict decode.)
 //   2. Tool-level reasons, defined here, for refusals that have nothing to
 //      do with the gate's one security rule: read-budget-exhausted,
 //      byte-budget-exhausted, invalid-offset. Collapsing these into the
-//      gate's six would misrepresent them -- a budget refusal is not a
+//      gate's seven would misrepresent them -- a budget refusal is not a
 //      security decision about the path, and folding it into e.g.
 //      "outside-repo" would actively mislead the model about why the call
 //      failed and what to do next.
 //
 // A future reader should not see "unsupported-encoding" mentioned in both
-// bullets above and conclude the six-string list grew to eight -- it did
-// not; the six are still exactly the six, and the other three live in this
-// separate, tool-owned namespace.
+// bullets above and conclude the seven-string list grew to nine -- it did
+// not; the seven are still exactly the seven, and the other three live in
+// this separate, tool-owned namespace.
 // ---------------------------------------------------------------------------
 
 function asArgs(a) { return a && typeof a === "object" ? a : {}; }
@@ -572,7 +662,7 @@ const SLOW_REQUEST_MS = 120 * 1000;
 // cap report prints it as its FIRST line, so a pasted report names exactly
 // which copy of this script produced it -- and it must equal the first date
 // on that version-line entry, which is asserted before release.
-const ROSTER_AGENT_VERSION = "2026-09-02";
+const ROSTER_AGENT_VERSION = "2026-09-04";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -589,23 +679,27 @@ const MIN_RETRY_BUDGET_MS = 15000;
 const FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions";
 const MAX_TOKENS = 32768; // matches the sealed roster route's completion budget
 
-// resolveInRepo's six reason strings (the confinement gate) -- see the
+// resolveInRepo's seven reason strings (the confinement gate) -- see the
 // two-namespace statement in the tools section above, which this extends
 // into a THIRD: these are the only reasons that mean "this exact path is
-// permanently invalid," which is what the refused-3-times counter below
-// keys on. Tool-level reasons (read-budget-exhausted, byte-budget-exhausted,
+// invalid as given for this run," which is what the refused-3-times counter
+// below keys on. "not-found" is in the set even though such a path is not
+// invalid forever: nothing the model can do changes the tree under a review,
+// so a fourth ask for the same missing path is noise -- while a corrected
+// path normalizes to a DIFFERENT key (normalizeRefusalKey below) and gets
+// its own three. Tool-level reasons (read-budget-exhausted, byte-budget-exhausted,
 // invalid-offset) are NOT in this set on purpose -- a budget refusal says
 // nothing about the path itself (retrying a different path is still fine,
 // and once the budget is gone every path fails regardless), and
 // invalid-offset is an argument problem, not a path problem, so a model
 // that corrects its offset on the same path must not be short-circuited.
 const GATE_REASONS = new Set([
-  "outside-repo", "git-skip", "not-a-file", "not-a-directory", "binary", "unsupported-encoding",
+  "outside-repo", "not-found", "git-skip", "not-a-file", "not-a-directory", "binary", "unsupported-encoding",
 ]);
 
 // ---------------------------------------------------------------------------
 // Agent-level structured tool errors -- a THIRD reason namespace, alongside
-// the gate's six and the tools' three. These never come from the gate or
+// the gate's seven and the tools' three. These never come from the gate or
 // the tools; they are refusals this loop itself manufactures because the
 // request never reached a tool at all (too many calls in one message, an
 // unparseable arguments string, an unrecognized tool name, or a path this
