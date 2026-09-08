@@ -12,7 +12,8 @@
 // roster route instead.
 //
 //   node <skill-dir>/roster-agent.js <doc-path> <repo-root>
-//   environment: FW_MODEL, FW_PROMPT_REPO_AWARE, FIREWORKS_API_KEY
+//   environment: FW_MODEL, FW_PROMPT_REPO_AWARE, FIREWORKS_API_KEY, and
+//   FW_REASONING_EFFORT (optional)
 //
 // Spec: "Repo-aware roster route -- design" (designed 2026-08-19), plus
 // the final-phase state machine of "The synthesis turn: keep the tools,
@@ -655,6 +656,17 @@ const MIN_EXPLORATION_REQUEST_MS = 60 * 1000;
 // Part 4 renders the label ("over 120s") from this constant, never as a
 // literal.
 const SLOW_REQUEST_MS = 120 * 1000;
+// R15: a request whose wall-clock duration exceeds EITHER its monotonic
+// duration OR the bound its abort timer was armed with, by more than this,
+// is a clock JUMP -- the machine slept (no timer fires while it does; the
+// wall clock jumps on waking), or the clock was set forward. Counted in
+// caps, named in a transport-failure reason on that request, invisible
+// otherwise. Two signals because whether this platform's monotonic clock
+// stops during a suspend is unverified: the first is exact when it does,
+// the second is a floor when it does not (a sleep that ended inside the
+// request's bound is invisible to it). Neither is read by any deadline or
+// clip -- R15 reports, it never acts.
+const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // R12: the version of this script, bumped with every behavior change from
 // now on. The date of the SKILL.md version-line entry that ships it, with
 // ".2", ".3" ... appended when a second behavior change ships the same day.
@@ -662,7 +674,10 @@ const SLOW_REQUEST_MS = 120 * 1000;
 // cap report prints it as its FIRST line, so a pasted report names exactly
 // which copy of this script produced it -- and it must equal the first date
 // on that version-line entry, which is asserted before release.
-const ROSTER_AGENT_VERSION = "2026-09-04";
+// This bump ships two behavior changes together: R14 (reasoning_effort
+// forwarded on every Engine 3b send when the caller sets it) and R15 (the
+// monotonic clock, the clock-jump caps line, and the failing-request suffix).
+const ROSTER_AGENT_VERSION = "2026-09-08";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -946,6 +961,15 @@ function dropAllToolExchanges(messages, survivingById) {
 
 function describeTransportError(e) { return e && e.message ? e.message : String(e); }
 
+// R15: the default monotonic clock. Prefers performance.now() (monotonic,
+// sub-ms) and falls back to process.hrtime.bigint() (monotonic, ns) divided
+// down to ms for a runtime where performance is unavailable. Never Date.now
+// -- that IS the wall clock this exists to measure against.
+function defaultMonotonicNow() {
+  if (typeof performance !== "undefined" && performance && typeof performance.now === "function") return performance.now();
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
 function emptyCaps() {
   return {
     reads: 0, bytes: 0, survivingEntries: 0,
@@ -964,6 +988,10 @@ function emptyCaps() {
     synthesisEntry: null, synthesisEntryRemainingMs: null,
     synthesisRequests: 0, synthesisLongestMs: null,
     explorationFailure: null,
+    // R15 -- the clock-jump accumulator, at its "no jump measured" values.
+    clockJumpMs: 0, clockJumpRequests: 0,
+    // R14 -- the setting in force, echoed on every path. null means unset.
+    reasoningEffort: null,
   };
 }
 
@@ -982,6 +1010,7 @@ function emptyCaps() {
  * incomplete exits, such as a CANARY mismatch, where the review itself is
  * exactly the thing being flagged as unverified, not discarded.
  * `fetchImpl` defaults to the global fetch. `now` (default Date.now),
+ * `monotonicNow` (default defaultMonotonicNow -- see R15 below),
  * `setTimeoutImpl`/`clearTimeoutImpl` (default the globals) are optional
  * clock/timer injection points so tests can drive wall-clock and
  * per-request timeout behavior deterministically, without sleeping.
@@ -989,17 +1018,41 @@ function emptyCaps() {
  * real request; it is never placed in anything this function returns or
  * logs.
  */
-async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, setTimeoutImpl, clearTimeoutImpl } = {}) {
-  // CAUTION: now/setTimeoutImpl/clearTimeoutImpl are
+async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, monotonicNow, setTimeoutImpl, clearTimeoutImpl, reasoningEffort } = {}) {
+  // CAUTION: now/monotonicNow/setTimeoutImpl/clearTimeoutImpl are
   // TESTING-ONLY seams for driving wall-clock and per-request-timeout
   // behavior deterministically. The CLI entry point must never pass them.
   // A no-op setTimeoutImpl silently disarms the AbortController abort --
   // the per-request timeout cap would stop being enforced with no error of
   // any kind -- and a real caller that spreads a config/options object
-  // into runReview(...) could pass one by accident. These three exist
+  // into runReview(...) could pass one by accident. These four exist
   // solely for this test suite.
   const doFetch = fetchImpl || fetch;
   const clockNow = typeof now === "function" ? now : Date.now;
+  // R15 -- the monotonic clock. Never used for any deadline or clip: those
+  // stay on clockNow (the wall clock is what the harness and the user
+  // experience). It exists only to MEASURE the wall clock against. An
+  // injected `now` without an injected `monotonicNow` turns measurement
+  // OFF: the fast suite's clock rows drive a fake wall clock by hundreds of
+  // seconds against real time, and every one would otherwise read as a
+  // sleep. The CLI injects neither.
+  const monoNow = typeof monotonicNow === "function" ? monotonicNow : defaultMonotonicNow;
+  const jumpEnabled = !(typeof now === "function" && typeof monotonicNow !== "function");
+  // R14 -- reasoning_effort, forwarded verbatim on EVERY send or on none.
+  // The value is the caller's (the CLI reads FW_REASONING_EFFORT, which the
+  // roster table in SKILL.md sets per model); this script never inspects the
+  // model string. Empty string means unset. Anything that is neither a
+  // non-empty string nor a non-negative integer is a caller error, thrown
+  // here, before any request. 0 is forwarded as given: the integer form is
+  // the API's token budget and what 0 means there is the API's to say.
+  const effort = (reasoningEffort === undefined || reasoningEffort === "") ? undefined : reasoningEffort;
+  if (effort !== undefined && !((typeof effort === "string" && effort.length > 0) || (typeof effort === "number" && Number.isSafeInteger(effort) && effort >= 0))) {
+    throw new TypeError("reasoningEffort must be a non-empty string or a non-negative integer");
+  }
+  // R14 -- a run that fails before its first send still reports the setting
+  // that was in force: the early returns build their caps here, not from
+  // emptyCaps() alone.
+  const earlyCaps = () => ({ ...emptyCaps(), reasoningEffort: effort === undefined ? null : effort });
   const scheduleTimeout = typeof setTimeoutImpl === "function" ? setTimeoutImpl : setTimeout;
   const cancelTimeout = typeof clearTimeoutImpl === "function" ? clearTimeoutImpl : clearTimeout;
   const startTime = clockNow();
@@ -1026,7 +1079,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   try {
     docContent = fs.readFileSync(docAbs, "utf8");
   } catch (e) {
-    return { review: null, trace: [], caps: emptyCaps(), status: "incomplete", reason: `doc-read-failed: could not read "${docPath}" (resolved to "${docAbs}" from cwd "${invocationCwd}"): ${e.message}` };
+    return { review: null, trace: [], caps: earlyCaps(), status: "incomplete", reason: `doc-read-failed: could not read "${docPath}" (resolved to "${docAbs}" from cwd "${invocationCwd}"): ${e.message}` };
   }
 
   // Step 2: normalize repoRoot (MSYS forms), then realpath it. Both sides
@@ -1036,16 +1089,16 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   try {
     rootReal = fs.realpathSync(fromMsys(repoRoot));
   } catch (e) {
-    return { review: null, trace: [], caps: emptyCaps(), status: "incomplete", reason: `repo-root-invalid: "${repoRoot}" does not resolve: ${e.message}` };
+    return { review: null, trace: [], caps: earlyCaps(), status: "incomplete", reason: `repo-root-invalid: "${repoRoot}" does not resolve: ${e.message}` };
   }
 
   // Step 3: refuse unless rootReal exists and is a directory, so a
   // caller-supplied root cannot silently widen the boundary.
   let rootStat;
   try { rootStat = fs.statSync(rootReal); }
-  catch (e) { return { review: null, trace: [], caps: emptyCaps(), status: "incomplete", reason: `repo-root-invalid: "${rootReal}" could not be stat'd: ${e.message}` }; }
+  catch (e) { return { review: null, trace: [], caps: earlyCaps(), status: "incomplete", reason: `repo-root-invalid: "${rootReal}" could not be stat'd: ${e.message}` }; }
   if (!rootStat.isDirectory()) {
-    return { review: null, trace: [], caps: emptyCaps(), status: "incomplete", reason: `repo-root-invalid: "${rootReal}" is not a directory` };
+    return { review: null, trace: [], caps: earlyCaps(), status: "incomplete", reason: `repo-root-invalid: "${rootReal}" is not a directory` };
   }
 
   // Step 4. Note: resolveInRepo already anchors every relative
@@ -1144,6 +1197,10 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     // and the reason string of an intact exploration failure that was handed
     // over to the synthesis turn rather than ending the run.
     synthesisEntry: null, synthesisEntryRemainingMs: null, explorationFailure: null,
+    // R15 -- the clock-jump accumulator: incremented once per request, in
+    // singleRequest's `finally`, whenever jumpMs exceeds
+    // CLOCK_JUMP_THRESHOLD_MS. See emptyCaps above for the "no jump" values.
+    clockJumpMs: 0, clockJumpRequests: 0,
   };
   // R12 -- the EXPLORATION budget: the wall clock an exploration send may
   // spend without eating into the reserve the synthesis turn is owed. The
@@ -1224,6 +1281,11 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
       synthesisRequests: flags.synthesisRequests,
       synthesisLongestMs: flags.synthesisLongestMs,
       explorationFailure: flags.explorationFailure,
+      // R15 -- mirrors emptyCaps() above field for field.
+      clockJumpMs: flags.clockJumpMs,
+      clockJumpRequests: flags.clockJumpRequests,
+      // R14 -- mirrors emptyCaps() above field for field.
+      reasoningEffort: effort === undefined ? null : effort,
     };
   }
 
@@ -1265,7 +1327,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   // because a review whose evidence was all discarded must never be reported
   // as grounded. ---
   async function singleRequest(withTools) {
-    const payload = { model, max_tokens: MAX_TOKENS, messages, ...(withTools ? { tools: TOOL_SCHEMAS } : {}) };
+    const payload = { model, max_tokens: MAX_TOKENS, messages, ...(withTools ? { tools: TOOL_SCHEMAS } : {}), ...(effort === undefined ? {} : { reasoning_effort: effort }) };
     // FIREWORKS_API_KEY is read here only to build this header; it is never
     // stored anywhere this function returns, logs, or throws.
     const apiKey = process.env.FIREWORKS_API_KEY || "";
@@ -1299,7 +1361,8 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
     // fast suite drives elapsed deterministically and a divergence between
     // the two clocks cannot hide until the real-time e2e run.
     const t0 = clockNow();
-    let res = null, body;
+    const m0 = monoNow();
+    let res = null, body, early = null, jumpMs = 0;
     try {
       res = await doFetch(FIREWORKS_URL, init);
       body = await res.json();
@@ -1310,28 +1373,41 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
       // (what a real fetch implementation rejects the body promise with).
       // Any OTHER body-read failure is a genuinely non-JSON body and keeps
       // its byte-stable malformed-response reason.
-      if (res === null) return { transportError: true, error: e };
-      if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError")) {
-        return { transportError: true, error: e };
+      if (res === null) early = { transportError: true, error: e };
+      else if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError")) {
+        early = { transportError: true, error: e };
       }
-      return { ok: false, reason: `malformed-response: non-JSON body (HTTP ${res.status}): ${e.message}`, evidenceIntact: true };
+      else early = { ok: false, reason: `malformed-response: non-JSON body (HTTP ${res.status}): ${e.message}`, evidenceIntact: true };
     } finally {
       if (timer) cancelTimeout(timer);
-      recordRequest(sentInFinalPhase, clockNow() - t0);
+      const wallMs = clockNow() - t0;
+      // R15 -- both signals; the larger wins. See CLOCK_JUMP_THRESHOLD_MS. The
+      // second signal is only meaningful when a timer was actually armed
+      // (timer !== null -- AbortController exists on this runtime) and
+      // measured against the bound it was armed with (Math.max(1,
+      // timeoutMs), not the raw timeoutMs the clip produced): those are two
+      // different numbers whenever timeoutMs < 1.
+      if (jumpEnabled) jumpMs = Math.max(wallMs - (monoNow() - m0), (timer !== null && Number.isFinite(timeoutMs)) ? wallMs - Math.max(1, timeoutMs) : -Infinity);
+      if (jumpMs > CLOCK_JUMP_THRESHOLD_MS) { flags.clockJumpMs += jumpMs; flags.clockJumpRequests += 1; }
+      recordRequest(sentInFinalPhase, wallMs);
     }
+    // R15 -- every result names its own jump, so a caller composing a
+    // reason reads the request it describes and nothing shared.
+    const stamp = (r) => (jumpMs > CLOCK_JUMP_THRESHOLD_MS ? Object.assign(r, { clockJumpMs: jumpMs }) : r);
+    if (early) return stamp(early);
 
     if (!res.ok) {
       const errObj = body && body.error;
       const isContextLength = !!errObj && (errObj.code === "context_length_exceeded" || /context length/i.test(String(errObj.message || "")));
-      if (isContextLength) return { contextLengthError: true, status: res.status };
-      return { ok: false, reason: `http-error: HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}`, evidenceIntact: true };
+      if (isContextLength) return stamp({ contextLengthError: true, status: res.status });
+      return stamp({ ok: false, reason: `http-error: HTTP ${res.status} ${JSON.stringify(body).slice(0, 300)}`, evidenceIntact: true });
     }
     const choice = body && Array.isArray(body.choices) && body.choices[0];
     const message = choice && choice.message;
     if (!message || typeof message !== "object") {
-      return { ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})`, evidenceIntact: true };
+      return stamp({ ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})`, evidenceIntact: true });
     }
-    return { ok: true, message, finishReason: choice.finish_reason };
+    return stamp({ ok: true, message, finishReason: choice.finish_reason });
   }
 
   // R12 -- the retry gate is PHASE-AWARE, reading flags.inFinalPhase, the
@@ -1341,16 +1417,20 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
   // less than MIN_EXPLORATION_REQUEST_MS of exploration budget is refused,
   // with its own text naming the exploration clock. A string that names the
   // exploration clock is never produced in the final phase, and vice versa.
+  // R15 -- the suffix reads the result of the very send the reason
+  // describes; a retry pair's two results each carry their own jump or none.
+  // No shared mutable state: this reads only its argument.
+  const jumpSuffix = (r) => (r && r.clockJumpMs > 0) ? ` (after a clock jump of ${Math.round(r.clockJumpMs / 1000)}s)` : "";
   async function requestWithTransportRetry(withTools) {
     let r = await singleRequest(withTools);
     if (r.transportError) {
       if (flags.inFinalPhase) {
-        if (remainingMs() <= 0) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (no wall-clock time left to retry)`, evidenceIntact: true };
+        if (remainingMs() <= 0) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)}${jumpSuffix(r)} (no wall-clock time left to retry)`, evidenceIntact: true };
       } else if (!explorationSendAffordable()) {
-        return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (no exploration time left to retry)`, evidenceIntact: true };
+        return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)}${jumpSuffix(r)} (no exploration time left to retry)`, evidenceIntact: true };
       }
       r = await singleRequest(withTools);
-      if (r.transportError) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)} (after one retry)`, evidenceIntact: true };
+      if (r.transportError) return { ok: false, reason: `transport-failure: ${describeTransportError(r.error)}${jumpSuffix(r)} (after one retry)`, evidenceIntact: true };
     }
     return r;
   }
@@ -1871,7 +1951,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, set
 
 const USAGE = [
   "usage: node roster-agent.js <doc-path> <repo-root>",
-  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported.",
+  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported; FW_REASONING_EFFORT is optional.",
 ].join("\n");
 
 function clip(value, max) {
@@ -1978,6 +2058,9 @@ function formatCaps(caps, reviewed) {
     // existed the only way to tell which copy of this script produced one was
     // to look for a line that did not exist at the version being blamed.
     "  roster-agent version: " + ROSTER_AGENT_VERSION,
+    // R14 -- the setting in force, always printed, so a pasted report says
+    // whether the run's reasoning was bounded and to what.
+    "  reasoning: " + (caps.reasoningEffort === null || caps.reasoningEffort === undefined ? "model default" : String(caps.reasoningEffort)),
     "  reads " + caps.reads + "/" + READS_CAP +
       "   bytes returned " + caps.bytes + "/" + TOTAL_BYTES_CAP +
       "   of which file content " + caps.fileContentBytes +
@@ -2025,6 +2108,11 @@ function formatCaps(caps, reviewed) {
         " with " + formatSeconds(caps.synthesisEntryRemainingMs) + " remaining" +
         "   requests " + caps.synthesisRequests +
         "   longest " + formatSeconds(caps.synthesisLongestMs),
+    // R15 -- printed only when a jump was measured; the zero case is silent
+    // so a clean report reads exactly as before.
+    ...(caps.clockJumpMs > 0
+      ? ["  clock jumped: +" + formatSeconds(caps.clockJumpMs) + " across " + caps.clockJumpRequests + " request" + (caps.clockJumpRequests === 1 ? "" : "s") + " (the machine slept, or the clock was set forward)"]
+      : []),
   ];
   if (caps.noFileContentRead && reviewed) {
     lines.push("  NO FILE CONTENT READ -- informational, not a verdict: a document that makes no");
@@ -2050,19 +2138,32 @@ async function main() {
   }
   const model = process.env.FW_MODEL;
   if (!model) { process.stderr.write("FW_MODEL not set -- refusing to guess a roster model\n"); return 2; }
+  // R14 -- reasoning_effort from the environment: unset or empty is "model
+  // default"; a string of decimal digits is a number (Fireworks' integer
+  // budget); a string that LOOKS numeric but is not one of those (-1, 1.5,
+  // +3) is refused here, on the same path as a missing FW_MODEL, because
+  // the library forwards any non-empty string and the API would get it
+  // verbatim; anything else is passed as the string it is ("low", "none",
+  // …). The roster table in SKILL.md is where per-model values live.
+  const effortRaw = (process.env.FW_REASONING_EFFORT || "").trim();
+  if ((/^[-+.\d]+$/.test(effortRaw) && !/^\d+$/.test(effortRaw)) || (/^\d+$/.test(effortRaw) && effortRaw.length > 15)) {
+    process.stderr.write("FW_REASONING_EFFORT must be a level name (low, medium, high, max, none) or a non-negative integer token budget of at most 15 digits; got: " + effortRaw + "\n");
+    return 2;
+  }
+  const reasoningEffort = effortRaw === "" ? undefined : (/^\d+$/.test(effortRaw) ? Number(effortRaw) : effortRaw);
   const prompt = process.env.FW_PROMPT_REPO_AWARE;
   if (!prompt) {
     process.stderr.write("FW_PROMPT_REPO_AWARE not set -- refusing to review without the review contract\n");
     return 2;
   }
 
-  // runReview also accepts now/setTimeoutImpl/clearTimeoutImpl. Those are
-  // TESTING-ONLY seams and are deliberately NOT passed here, and no options
-  // object is spread in that could carry one by accident: a no-op
-  // setTimeoutImpl silently disarms the AbortController behind the
-  // per-request timeout, so that cap would stop being enforced with no error
-  // of any kind. Pass exactly these four arguments.
-  const result = await runReview({ docPath: docPath, repoRoot: repoRoot, model: model, prompt: prompt });
+  // runReview also accepts now/monotonicNow/setTimeoutImpl/clearTimeoutImpl.
+  // Those are TESTING-ONLY seams and are deliberately NOT passed here, and
+  // no options object is spread in that could carry one by accident: a
+  // no-op setTimeoutImpl silently disarms the AbortController behind the
+  // per-request timeout, so that cap would stop being enforced with no
+  // error of any kind. Pass exactly these five arguments.
+  const result = await runReview({ docPath: docPath, repoRoot: repoRoot, model: model, prompt: prompt, reasoningEffort: reasoningEffort });
 
   const out = [];
   if (result.status !== "ok") {
