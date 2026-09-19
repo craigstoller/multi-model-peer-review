@@ -674,10 +674,14 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // cap report prints it as its FIRST line, so a pasted report names exactly
 // which copy of this script produced it -- and it must equal the first date
 // on that version-line entry, which is asserted before release.
-// This bump ships two behavior changes together: R14 (reasoning_effort
+// The 2026-09-08 bump shipped two behavior changes together: R14 (reasoning_effort
 // forwarded on every Engine 3b send when the caller sets it) and R15 (the
 // monotonic clock, the clock-jump caps line, and the failing-request suffix).
-const ROSTER_AGENT_VERSION = "2026-09-08";
+// The 2026-09-18 bump ships none in this script: the sealed Engine 3 block
+// changed, the version line's date moved with it, and the tie rule (the date
+// part of this constant equals the first date on the version line) holds the
+// constant to that date.
+const ROSTER_AGENT_VERSION = "2026-09-18";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
