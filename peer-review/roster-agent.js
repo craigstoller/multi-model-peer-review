@@ -681,7 +681,9 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // changed, the version line's date moved with it, and the tie rule (the date
 // part of this constant equals the first date on the version line) holds the
 // constant to that date.
-const ROSTER_AGENT_VERSION = "2026-09-18";
+// The 2026-09-26 bump ships none in this script either: the roster table's
+// DeepSeek pin moved, and the tie rule moves the constant with the date.
+const ROSTER_AGENT_VERSION = "2026-09-26";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
