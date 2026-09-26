@@ -683,7 +683,10 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // constant to that date.
 // The 2026-09-26 bump ships none in this script either: the roster table's
 // DeepSeek pin moved, and the tie rule moves the constant with the date.
-const ROSTER_AGENT_VERSION = "2026-09-26";
+// 2026-09-26.4 is the second behavior change that day, and the first in this
+// script: a canary-mismatch reason now ends with the reply's finish_reason
+// and token counts (finishSuffix). The suffix matches the version line's.
+const ROSTER_AGENT_VERSION = "2026-09-26.4";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -1181,6 +1184,12 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   const usedIds = new Set();
   const ctx = { rootReal, budget: { bytes: 0, reads: 0 } };
   const refusalCounts = new Map();
+  // The `usage` object of the most recent SUCCESSFUL response, written in one
+  // place (singleRequest's ok return). It is the usage of the message the
+  // final phase classifies, because every send that fails between that
+  // response and the classification ends the run instead. Read only by
+  // finishSuffix, for the canary-mismatch reason.
+  let lastResponseUsage;
   const flags = {
     iterationsCapHit: false, wallClockCapHit: false,
     contextLengthSalvageAttempted: false, contextLengthSalvageSucceeded: false, evidenceDiscarded: false,
@@ -1413,6 +1422,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
     if (!message || typeof message !== "object") {
       return stamp({ ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})`, evidenceIntact: true });
     }
+    lastResponseUsage = body.usage;
     return stamp({ ok: true, message, finishReason: choice.finish_reason });
   }
 
@@ -1572,6 +1582,24 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
 
   function applyNoFileContentMarker(text, caps) {
     return caps.noFileContentRead ? "NO FILE CONTENT READ\n\n" + text : text;
+  }
+
+  // How the classified reply ended, appended to a canary-mismatch reason.
+  // The mismatch is classified BEFORE finish_reason is read (row 1 below),
+  // so a reply cut off by a length limit -- which carries no CANARY line --
+  // reports canary-missing; this suffix is what tells that apart from a
+  // reply the model ended itself. Field-reported 2026-09-26: a repo-aware
+  // review ended mid-word under canary-missing with nothing on the report to
+  // say which. finish_reason prints as the truncated reason prints it
+  // (`undefined` when absent); the token counts print only when the
+  // response carried them.
+  function finishSuffix(finishReason) {
+    const parts = [`finish_reason=${finishReason}`];
+    const u = lastResponseUsage;
+    if (u && Number.isFinite(u.completion_tokens)) parts.push(`completion_tokens=${u.completion_tokens}`);
+    const r = u && u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens;
+    if (Number.isFinite(r)) parts.push(`reasoning_tokens=${r}`);
+    return ` (${parts.join(", ")})`;
   }
 
   // finishReason !== "stop" (e.g. "length": the model hit max_tokens) means
@@ -1747,7 +1775,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
         const caps = computeCaps();
         const review = applyNoFileContentMarker(classified.strippedContent, caps);
         if (classified.mismatch) {
-          return { review, trace, caps, status: "incomplete", reason: classified.reason };
+          return { review, trace, caps, status: "incomplete", reason: classified.reason + finishSuffix(finishReason) };
         }
         if (finishReason !== "stop") {
           return { review, trace, caps, status: "incomplete", reason: `truncated: finish_reason=${finishReason} (partial text preserved)` };
