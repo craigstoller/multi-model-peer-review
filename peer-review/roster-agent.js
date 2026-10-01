@@ -651,6 +651,108 @@ const SYNTHESIS_RESERVE_MS = 300 * 1000;
 // stays the FINAL phase's floor -- a retry there re-sends a conversation the
 // model has already answered once, and R9 sized it for that.
 const MIN_EXPLORATION_REQUEST_MS = 60 * 1000;
+// R17 -- clock profiles. "standard" is the constants above, unchanged: it is
+// the only profile a FOREGROUND Bash call can run, since the harness kills a
+// foreground call at 600 s, and 555 s plus the 15 s backstop must beat that.
+// "long" is for a call launched in the BACKGROUND, which that ceiling does
+// not bind: twice the reserve, a 600 s exploration window, and a per-request
+// ceiling that never binds exploration (whose sends clip to at most
+// remaining - 600 s) but lets a synthesis turn after a short exploration use
+// the time exploration left. MIN_EXPLORATION_REQUEST_MS and SLOW_REQUEST_MS
+// are shared. The caller picks the profile (the CLI reads FW_CLOCK); this
+// script never inspects the model string.
+const CLOCK_PROFILES = Object.freeze({
+  standard: Object.freeze({ wallClockMs: WALL_CLOCK_MS, synthesisReserveMs: SYNTHESIS_RESERVE_MS, requestTimeoutCapMs: REQUEST_TIMEOUT_CAP_MS }),
+  long: Object.freeze({ wallClockMs: 1200 * 1000, synthesisReserveMs: 600 * 1000, requestTimeoutCapMs: 900 * 1000 }),
+});
+// R17 -- Node's built-in fetch (undici) gives up on a response whose headers take more than
+// 300 s (UND_ERR_HEADERS_TIMEOUT, reported as a bare "fetch failed"), and on a body that sends
+// nothing for 300 s between two chunks (its body timeout). Before requests streamed, a
+// completion sent no headers until the model had finished, so every request was capped at
+// about 300 s whatever the clock allowed. Measured 2026-09-28: the default fetch failed at
+// 304.9 s against a local server holding its response 310 s; a dispatcher with undici's header
+// and body timeouts turned off returned at 310.0 s. Requests now stream (see assembleStream),
+// so headers arrive within seconds; the dispatcher stays, and its bodyTimeout: 0 now also
+// covers the gaps between chunks, so no gap is cut at 300 s while the request's own bound
+// still has time. Each request here has its own abort timer, which is that bound, so the
+// default fetch gets that dispatcher. Node does not export undici, so the dispatcher is built
+// from the global dispatcher's own class; a data: fetch creates the global dispatcher when no
+// request has yet. Where none can be built, requests go out as before, and the cap report says
+// so.
+const GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+async function unlimitedDispatcher(fetchFn, g = globalThis) {
+  try {
+    if (!g[GLOBAL_DISPATCHER]) await fetchFn("data:,");
+    const d = g[GLOBAL_DISPATCHER];
+    return d && typeof d.constructor === "function" ? new d.constructor({ headersTimeout: 0, bodyTimeout: 0 }) : null;
+  } catch (e) {
+    return null;
+  }
+}
+// R17 -- every request streams (`stream: true`). Fireworks' gateway ends a request that has
+// sent no byte for about 600 s with HTTP 504 GATEWAY_TIMEOUT: seen 2026-09-28 on three sealed
+// Kimi calls at 611-613 s, below this route's 900 s per-request ceiling on the long clock. The
+// same request streamed returned its first byte at 3.46 s and ran 723.6 s to `[DONE]`. The
+// reply is Server-Sent Events: `data: <json>` lines, blank lines between events, `data: [DONE]`
+// last. This reads it back into the shape of a non-stream chat-completions body, so nothing past
+// the body read changes: { model, usage, choices: [{ index: 0, message: { role: "assistant",
+// content, tool_calls }, finish_reason }] }, or { error } when a chunk carries one. Reasoning
+// arrives as delta.reasoning_content and is not read, as it never was. A cut stream has no
+// finish_reason, which stays undefined, and the missing-finish_reason handling applies. A data
+// line that is not JSON throws, and the caller reports a malformed body.
+function assembleStream(text) {
+  let model, usage, finishReason, content = null;
+  const calls = new Map();
+  for (const rawLine of String(text).split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (payload === "" || payload === "[DONE]") continue;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch (e) { throw new Error("non-JSON stream chunk: " + payload.slice(0, 120)); }
+    if (!chunk || typeof chunk !== "object") continue;
+    if (chunk.error) return { error: chunk.error };
+    if (typeof chunk.model === "string") model = chunk.model;
+    if (chunk.usage && typeof chunk.usage === "object") usage = chunk.usage;
+    const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : null;
+    if (!choice || typeof choice !== "object") continue;
+    if (choice.finish_reason !== null && choice.finish_reason !== undefined) finishReason = choice.finish_reason;
+    const delta = choice.delta;
+    if (!delta || typeof delta !== "object") continue;
+    if (typeof delta.content === "string") content = (content === null ? "" : content) + delta.content;
+    if (!Array.isArray(delta.tool_calls)) continue;
+    delta.tool_calls.forEach((tc, i) => {
+      if (!tc || typeof tc !== "object") return;
+      const index = Number.isInteger(tc.index) ? tc.index : i;
+      let acc = calls.get(index);
+      if (!acc) { acc = { id: undefined, type: undefined, name: "", arguments: "" }; calls.set(index, acc); }
+      if (acc.id === undefined && typeof tc.id === "string" && tc.id !== "") acc.id = tc.id;
+      if (acc.type === undefined && typeof tc.type === "string") acc.type = tc.type;
+      const fn = tc.function;
+      if (fn && typeof fn === "object") {
+        if (typeof fn.name === "string") acc.name += fn.name;
+        if (typeof fn.arguments === "string") acc.arguments += fn.arguments;
+      }
+    });
+  }
+  const message = { role: "assistant", content };
+  if (calls.size > 0) {
+    if (content === "") message.content = null;
+    message.tool_calls = [...calls.keys()].sort((a, b) => a - b).map((k) => {
+      const acc = calls.get(k);
+      return { id: acc.id, type: acc.type === undefined ? "function" : acc.type, function: { name: acc.name, arguments: acc.arguments } };
+    });
+  }
+  return { model, usage, choices: [{ index: 0, message, finish_reason: finishReason }] };
+}
+// R17 -- a response is read as a stream when it says it is one. A response with no headers
+// object (a test stub) is read as JSON, as every response was before requests streamed.
+function isEventStream(res) {
+  const h = res && res.headers;
+  if (!h || typeof h.get !== "function") return false;
+  const type = h.get("content-type");
+  return typeof type === "string" && type.toLowerCase().includes("text/event-stream");
+}
 // R12: the reporting threshold on the cap report's exploration line -- a
 // request slower than the pre-R12 cap, i.e. one the raise mattered for.
 // Part 4 renders the label ("over 120s") from this constant, never as a
@@ -686,7 +788,12 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // 2026-09-26.4 is the second behavior change that day, and the first in this
 // script: a canary-mismatch reason now ends with the reply's finish_reason
 // and token counts (finishSuffix). The suffix matches the version line's.
-const ROSTER_AGENT_VERSION = "2026-09-26.4";
+// 2026-09-28 is R17's behavior change in this script: the clock profiles
+// and the clockProfile option (standard unchanged; long for a background call).
+// The 2026-09-30 bump ships none in this script: SKILL.md's Codex command took
+// PR_LAUNCH (R19), the version line's date moved with it, and the tie rule
+// moves the constant with the date.
+const ROSTER_AGENT_VERSION = "2026-09-30";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -701,7 +808,16 @@ const SYNTHESIS_RETRIES = 2;
 const MIN_RETRY_BUDGET_MS = 15000;
 
 const FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions";
-const MAX_TOKENS = 32768; // matches the sealed roster route's completion budget
+// R17 -- a ceiling, not a budget. Fireworks bills the tokens a model
+// generates, not the cap, and lowers a cap past the context window to fit
+// rather than refusing it (probed 2026-09-27 up to 2,000,000). At measured
+// speeds (DeepSeek 65-80 tokens/s, Kimi about 45) even the long clock ends a
+// run before a model can write this many, so the clock, not the cap, stops a
+// runaway, and a cap that binds would only waste the thinking already paid
+// for. Whichever binds first, one request can bill at most this many output
+// tokens, about $2 at Kimi K3's 2026-09-27 rate. The sealed route carries the
+// same number.
+const MAX_TOKENS = 131072; // matches the sealed roster route's completion budget
 
 // resolveInRepo's seven reason strings (the confinement gate) -- see the
 // two-namespace statement in the tools section above, which this extends
@@ -1001,6 +1117,13 @@ function emptyCaps() {
     clockJumpMs: 0, clockJumpRequests: 0,
     // R14 -- the setting in force, echoed on every path. null means unset.
     reasoningEffort: null,
+    // R17 -- the clock in force. emptyCaps() is the standard profile; every
+    // run overrides it with its own (earlyCaps and computeCaps).
+    clock: { profile: "standard", ...CLOCK_PROFILES.standard },
+    // R17 -- nothing sent, nothing billed.
+    tokens: { sends: 0, reported: 0, prompt: 0, cached: 0, completion: 0, reasoning: 0 },
+    // R17 -- nothing sent, so nothing to say about the dispatcher either.
+    fetchTimeoutsLifted: null,
   };
 }
 
@@ -1027,7 +1150,7 @@ function emptyCaps() {
  * real request; it is never placed in anything this function returns or
  * logs.
  */
-async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, monotonicNow, setTimeoutImpl, clearTimeoutImpl, reasoningEffort } = {}) {
+async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatcher, now, monotonicNow, setTimeoutImpl, clearTimeoutImpl, reasoningEffort, clockProfile } = {}) {
   // CAUTION: now/monotonicNow/setTimeoutImpl/clearTimeoutImpl are
   // TESTING-ONLY seams for driving wall-clock and per-request-timeout
   // behavior deterministically. The CLI entry point must never pass them.
@@ -1058,14 +1181,22 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   if (effort !== undefined && !((typeof effort === "string" && effort.length > 0) || (typeof effort === "number" && Number.isSafeInteger(effort) && effort >= 0))) {
     throw new TypeError("reasoningEffort must be a non-empty string or a non-negative integer");
   }
+  // R17 -- the clock profile, checked here, before any request. Empty or
+  // absent is the standard profile, whose numbers are the constants above.
+  const profileName = (clockProfile === undefined || clockProfile === "") ? "standard" : clockProfile;
+  if (typeof profileName !== "string" || !Object.prototype.hasOwnProperty.call(CLOCK_PROFILES, profileName)) {
+    throw new TypeError('clockProfile must be "standard" or "long"');
+  }
+  const clock = CLOCK_PROFILES[profileName];
+  const clockCaps = { profile: profileName, wallClockMs: clock.wallClockMs, synthesisReserveMs: clock.synthesisReserveMs, requestTimeoutCapMs: clock.requestTimeoutCapMs };
   // R14 -- a run that fails before its first send still reports the setting
   // that was in force: the early returns build their caps here, not from
   // emptyCaps() alone.
-  const earlyCaps = () => ({ ...emptyCaps(), reasoningEffort: effort === undefined ? null : effort });
+  const earlyCaps = () => ({ ...emptyCaps(), reasoningEffort: effort === undefined ? null : effort, clock: clockCaps });
   const scheduleTimeout = typeof setTimeoutImpl === "function" ? setTimeoutImpl : setTimeout;
   const cancelTimeout = typeof clearTimeoutImpl === "function" ? clearTimeoutImpl : clearTimeout;
   const startTime = clockNow();
-  const remainingMs = () => WALL_CLOCK_MS - (clockNow() - startTime);
+  const remainingMs = () => clock.wallClockMs - (clockNow() - startTime);
   // requestTimeoutMs() itself is defined further below, once `ctx` and
   // `flags` exist -- R11's selection reads ctx.budget.bytes and
   // flags.inFinalPhase, both declared inside the try block below, and a
@@ -1190,6 +1321,27 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   // response and the classification ends the run instead. Read only by
   // finishSuffix, for the canary-mismatch reason.
   let lastResponseUsage;
+  // R17 -- what the run was billed for. `sends` counts every physical request
+  // (singleRequest is the one path to the network); `reported` counts the
+  // answered ones whose body carried a `usage` with a completion count, which
+  // is where Fireworks says what it charged. A request the clock aborted, one
+  // that failed, or a reply with no such `usage` reports nothing, and the cap
+  // report says how many of the run's requests did report.
+  const tokenTotals = { sends: 0, reported: 0, prompt: 0, cached: 0, completion: 0, reasoning: 0 };
+  function addUsage(u) {
+    if (!u || typeof u !== "object" || !Number.isFinite(u.completion_tokens)) return;
+    const n = (v) => (Number.isFinite(v) ? v : 0);
+    tokenTotals.reported += 1;
+    tokenTotals.prompt += n(u.prompt_tokens);
+    tokenTotals.cached += n(u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens);
+    tokenTotals.completion += n(u.completion_tokens);
+    tokenTotals.reasoning += n(u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens);
+  }
+  // R17 -- the dispatcher that lifts undici's 300 s timeouts, settled once, before the first
+  // send: a caller's own, or one built for the default fetch. An injected fetchImpl with no
+  // dispatcher (the test stubs) is left exactly as it was.
+  let requestDispatcher;
+  let fetchTimeoutsLifted = null;
   const flags = {
     iterationsCapHit: false, wallClockCapHit: false,
     contextLengthSalvageAttempted: false, contextLengthSalvageSucceeded: false, evidenceDiscarded: false,
@@ -1223,7 +1375,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   // transport-retry gate, and the salvage re-send gate), so they cannot
   // drift apart. Can go negative past the reserve; every caller either
   // compares it against the floor or clamps it.
-  const explorationBudgetMs = () => remainingMs() - SYNTHESIS_RESERVE_MS;
+  const explorationBudgetMs = () => remainingMs() - clock.synthesisReserveMs;
   // R12 -- the per-request bound. Defined here (not earlier, alongside
   // remainingMs) because it reads flags.inFinalPhase, declared just above;
   // see the comment at remainingMs's definition for why this placement is
@@ -1242,7 +1394,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   // dispatch site below.
   const requestTimeoutMs = () => {
     const budget = flags.inFinalPhase ? remainingMs() : explorationBudgetMs();
-    return Math.max(0, Math.min(REQUEST_TIMEOUT_CAP_MS, budget));
+    return Math.max(0, Math.min(clock.requestTimeoutCapMs, budget));
   };
   // R12 -- "may an exploration send launch at all?" The floor is what stops
   // a doomed send from spending a full prefill of the run's largest context
@@ -1301,6 +1453,12 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
       clockJumpRequests: flags.clockJumpRequests,
       // R14 -- mirrors emptyCaps() above field for field.
       reasoningEffort: effort === undefined ? null : effort,
+      // R17 -- mirrors emptyCaps() above field for field.
+      clock: clockCaps,
+      // R17 -- mirrors emptyCaps() above.
+      tokens: { ...tokenTotals },
+      // R17 -- mirrors emptyCaps() above field for field.
+      fetchTimeoutsLifted,
     };
   }
 
@@ -1342,7 +1500,13 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   // because a review whose evidence was all discarded must never be reported
   // as grounded. ---
   async function singleRequest(withTools) {
-    const payload = { model, max_tokens: MAX_TOKENS, messages, ...(withTools ? { tools: TOOL_SCHEMAS } : {}), ...(effort === undefined ? {} : { reasoning_effort: effort }) };
+    tokenTotals.sends += 1;
+    if (requestDispatcher === undefined) {
+      if (dispatcher !== undefined) { requestDispatcher = dispatcher || null; fetchTimeoutsLifted = !!dispatcher; }
+      else if (fetchImpl) { requestDispatcher = null; fetchTimeoutsLifted = null; }
+      else { requestDispatcher = await unlimitedDispatcher(doFetch); fetchTimeoutsLifted = !!requestDispatcher; }
+    }
+    const payload = { model, max_tokens: MAX_TOKENS, stream: true, messages, ...(withTools ? { tools: TOOL_SCHEMAS } : {}), ...(effort === undefined ? {} : { reasoning_effort: effort }) };
     // FIREWORKS_API_KEY is read here only to build this header; it is never
     // stored anywhere this function returns, logs, or throws.
     const apiKey = process.env.FIREWORKS_API_KEY || "";
@@ -1350,6 +1514,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + apiKey },
       body: JSON.stringify(payload),
+      ...(requestDispatcher ? { dispatcher: requestDispatcher } : {}),
     };
     let controller = null, timer = null;
     const timeoutMs = requestTimeoutMs();
@@ -1361,8 +1526,9 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
       init.signal = controller.signal;
       timer = scheduleTimeout(() => controller.abort(), Math.max(1, timeoutMs));
     }
-    // R12 -- THE PER-REQUEST BOUND COVERS THE BODY. res.json() is awaited
-    // inside the SAME try as doFetch, and the timer is cancelled in a
+    // R12 -- THE PER-REQUEST BOUND COVERS THE BODY. The body read (R17:
+    // res.text() for a stream, res.json() otherwise) is awaited inside the
+    // SAME try as doFetch, and the timer is cancelled in a
     // `finally` after BOTH. Cancelling at headers (what pre-R12 code did)
     // left the body read unbounded: a provider that sends headers promptly
     // and then streams a generation turn for minutes was outside the bound
@@ -1380,16 +1546,34 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
     let res = null, body, early = null, jumpMs = 0;
     try {
       res = await doFetch(FIREWORKS_URL, init);
-      body = await res.json();
+      // R17 -- a streamed reply is read whole and assembled into the
+      // non-stream shape; a non-stream reply is read exactly as before. A
+      // rejection of the stream branch's res.text() itself -- a dropped
+      // connection mid-generation (undici: TypeError: terminated), same as a
+      // drop before the headers -- is a transport failure, so it is tagged
+      // here and read by the shared catch below, next to the abort test.
+      // Only a THROW FROM assembleStream (a non-JSON chunk, text() having
+      // already resolved) is left untagged and falls to the malformed-body
+      // branch.
+      if (isEventStream(res)) {
+        let text;
+        try { text = await res.text(); }
+        catch (e) { if (e && typeof e === "object") e.__streamReadFailure = true; throw e; }
+        body = assembleStream(text);
+      }
+      else body = await res.json();
     } catch (e) {
       // A fetch throw is a transport failure, as before. A BODY read that
       // rejects is one too when it rejects because the bound fired -- either
       // our own controller says so, or the error names itself AbortError
-      // (what a real fetch implementation rejects the body promise with).
-      // Any OTHER body-read failure is a genuinely non-JSON body and keeps
-      // its byte-stable malformed-response reason.
+      // (what a real fetch implementation rejects the body promise with) --
+      // or (R17) because the stream branch's res.text() itself rejected, for
+      // ANY reason (the __streamReadFailure tag set above). Any OTHER
+      // body-read failure -- i.e. assembleStream throwing on a non-JSON
+      // chunk after text() already resolved -- is a genuinely non-JSON body
+      // and keeps its byte-stable malformed-response reason.
       if (res === null) early = { transportError: true, error: e };
-      else if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError")) {
+      else if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError") || (e && e.__streamReadFailure)) {
         early = { transportError: true, error: e };
       }
       else early = { ok: false, reason: `malformed-response: non-JSON body (HTTP ${res.status}): ${e.message}`, evidenceIntact: true };
@@ -1411,7 +1595,10 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
     const stamp = (r) => (jumpMs > CLOCK_JUMP_THRESHOLD_MS ? Object.assign(r, { clockJumpMs: jumpMs }) : r);
     if (early) return stamp(early);
 
-    if (!res.ok) {
+    // R17 -- an error inside a stream arrives after a 200's headers, so it is
+    // handled like a non-2xx error body: an in-stream context-length error
+    // salvages exactly as a 400 does.
+    if (!res.ok || (body && body.error)) {
       const errObj = body && body.error;
       const isContextLength = !!errObj && (errObj.code === "context_length_exceeded" || /context length/i.test(String(errObj.message || "")));
       if (isContextLength) return stamp({ contextLengthError: true, status: res.status });
@@ -1423,6 +1610,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
       return stamp({ ok: false, reason: `malformed-response: no choices[0].message in body (HTTP ${res.status})`, evidenceIntact: true });
     }
     lastResponseUsage = body.usage;
+    addUsage(body.usage);
     return stamp({ ok: true, message, finishReason: choice.finish_reason });
   }
 
@@ -1904,7 +2092,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
   let finalMessage = null;
   let finalFinishReason = null;
   for (let iter = 1; iter <= MAX_ITERATIONS; iter++) {
-    if (remainingMs() < SYNTHESIS_RESERVE_MS + MIN_EXPLORATION_REQUEST_MS) {
+    if (remainingMs() < clock.synthesisReserveMs + MIN_EXPLORATION_REQUEST_MS) {
       flags.synthesisEntry = "reserve";
       break;
     }
@@ -1985,7 +2173,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, now, mon
 
 const USAGE = [
   "usage: node roster-agent.js <doc-path> <repo-root>",
-  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported; FW_REASONING_EFFORT is optional.",
+  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported; FW_REASONING_EFFORT and FW_CLOCK (empty or standard, or long for a call launched in the background) are optional.",
 ].join("\n");
 
 function clip(value, max) {
@@ -2074,7 +2262,7 @@ function formatSeconds(ms) {
 function describeSynthesisEntry(caps) {
   if (caps.synthesisEntry === "natural") return "naturally";
   if (caps.synthesisEntry === "iterations") return "on loop iterations (" + MAX_ITERATIONS + ")";
-  if (caps.synthesisEntry === "reserve") return "on wall-clock reserve (" + (SYNTHESIS_RESERVE_MS / 1000) + "s)";
+  if (caps.synthesisEntry === "reserve") return "on wall-clock reserve (" + (caps.clock.synthesisReserveMs / 1000) + "s)";
   return "on exploration failure -- " + sanitizeReason(caps.explorationFailure);
 }
 
@@ -2085,7 +2273,7 @@ function formatCaps(caps, reviewed) {
   if (caps.toolCallsPerIterationCapHit) hit.push("tool calls in one message (" + MAX_TOOL_CALLS_PER_ITER + ")");
   if (caps.pathRefusalCapHit) hit.push("same path refused " + PATH_REFUSAL_LIMIT + " times");
   if (caps.iterationsCapHit) hit.push("loop iterations (" + MAX_ITERATIONS + ")");
-  if (caps.wallClockCapHit) hit.push("wall clock (" + (WALL_CLOCK_MS / 1000) + "s)");
+  if (caps.wallClockCapHit) hit.push("wall clock (" + (caps.clock.wallClockMs / 1000) + "s)");
   const lines = [
     // FIRST line of the cap report, unconditionally. A pasted report is the
     // only artifact a field observation ever carries, and until this line
@@ -2095,6 +2283,18 @@ function formatCaps(caps, reviewed) {
     // R14 -- the setting in force, always printed, so a pasted report says
     // whether the run's reasoning was bounded and to what.
     "  reasoning: " + (caps.reasoningEffort === null || caps.reasoningEffort === undefined ? "model default" : String(caps.reasoningEffort)),
+    // R17 -- the clock in force, printed only when it is not the standard
+    // one, so a standard run's cap report carries no clock line and a long
+    // run's says which clock its bounds came from.
+    // The exploration window is named outright, because the exploration
+    // line's "(ceiling Ns, ...)" clause states the per-request ceiling, which
+    // never binds an exploration send.
+    ...(caps.clock && caps.clock.profile !== "standard"
+      ? ["  clock: " + caps.clock.profile + " (wall " + (caps.clock.wallClockMs / 1000) + "s, synthesis reserve " +
+         (caps.clock.synthesisReserveMs / 1000) + "s, exploration window " +
+         ((caps.clock.wallClockMs - caps.clock.synthesisReserveMs) / 1000) + "s, per-request ceiling " +
+         (caps.clock.requestTimeoutCapMs / 1000) + "s)"]
+      : []),
     "  reads " + caps.reads + "/" + READS_CAP +
       "   bytes returned " + caps.bytes + "/" + TOTAL_BYTES_CAP +
       "   of which file content " + caps.fileContentBytes +
@@ -2130,8 +2330,8 @@ function formatCaps(caps, reviewed) {
     "  exploration: " + caps.explorationRequests + " requests" +
       "   longest " + formatSeconds(caps.explorationLongestMs) +
       "   over " + (SLOW_REQUEST_MS / 1000) + "s: " + caps.explorationSlowRequests +
-      "   (ceiling " + (REQUEST_TIMEOUT_CAP_MS / 1000) + "s, clipped to keep the " +
-      (SYNTHESIS_RESERVE_MS / 1000) + "s synthesis reserve)",
+      "   (ceiling " + (caps.clock.requestTimeoutCapMs / 1000) + "s, clipped to keep the " +
+      (caps.clock.synthesisReserveMs / 1000) + "s synthesis reserve)",
     // `not reached` is the whole line when the run ended inside exploration
     // and no synthesis turn was ever entered -- distinct from entering one and
     // sending nothing, which reads `requests 0` and means the pre-request
@@ -2146,6 +2346,22 @@ function formatCaps(caps, reviewed) {
     // so a clean report reads exactly as before.
     ...(caps.clockJumpMs > 0
       ? ["  clock jumped: +" + formatSeconds(caps.clockJumpMs) + " across " + caps.clockJumpRequests + " request" + (caps.clockJumpRequests === 1 ? "" : "s") + " (the machine slept, or the clock was set forward)"]
+      : []),
+    // R17 -- what the run was billed for, printed UNCONDITIONALLY, the zero
+    // case included, for the same reason as the lines above. Fireworks charges
+    // generated tokens, and on these reasoning models most of them are the
+    // reasoning, so the completion figure is where a review's cost is. Prices
+    // are not printed: they change, and the counts do not. The sums cover the
+    // requests that reported usage, and `reported by r of s` says how many did,
+    // so a run with aborted requests reads as a floor.
+    "  tokens: prompt " + caps.tokens.prompt + " (cached " + caps.tokens.cached + ")" +
+      "   completion " + caps.tokens.completion + " (reasoning " + caps.tokens.reasoning + ")" +
+      "   reported by " + caps.tokens.reported + " of " + caps.tokens.sends + " requests",
+    // R17 -- printed only when the default fetch kept undici's 300 s timeouts. Replies stream,
+    // so what is left of them is a gap of about 300 s between chunks, which cuts the reply as a
+    // transport failure whatever the clock allows.
+    ...(caps.fetchTimeoutsLifted === false
+      ? ["  fetch: Node's 300 s response timeout is still in force in this process, so a streamed reply that sends nothing for about 300 s is cut, as a transport failure"]
       : []),
   ];
   if (caps.noFileContentRead && reviewed) {
@@ -2185,6 +2401,15 @@ async function main() {
     return 2;
   }
   const reasoningEffort = effortRaw === "" ? undefined : (/^\d+$/.test(effortRaw) ? Number(effortRaw) : effortRaw);
+  // R17 -- the clock profile from the environment, trimmed: empty or
+  // `standard` is the standard clock (the only one a foreground Bash call can
+  // run), `long` is for a call launched in the background. Anything else is refused here,
+  // on the same path as a bad FW_REASONING_EFFORT, before any request.
+  const clockRaw = (process.env.FW_CLOCK || "").trim();
+  if (clockRaw !== "" && clockRaw !== "standard" && clockRaw !== "long") {
+    process.stderr.write("FW_CLOCK must be empty, standard or long; got: " + clockRaw + "\n");
+    return 2;
+  }
   const prompt = process.env.FW_PROMPT_REPO_AWARE;
   if (!prompt) {
     process.stderr.write("FW_PROMPT_REPO_AWARE not set -- refusing to review without the review contract\n");
@@ -2196,8 +2421,8 @@ async function main() {
   // no options object is spread in that could carry one by accident: a
   // no-op setTimeoutImpl silently disarms the AbortController behind the
   // per-request timeout, so that cap would stop being enforced with no
-  // error of any kind. Pass exactly these five arguments.
-  const result = await runReview({ docPath: docPath, repoRoot: repoRoot, model: model, prompt: prompt, reasoningEffort: reasoningEffort });
+  // error of any kind. Pass exactly these six arguments.
+  const result = await runReview({ docPath: docPath, repoRoot: repoRoot, model: model, prompt: prompt, reasoningEffort: reasoningEffort, clockProfile: clockRaw });
 
   const out = [];
   if (result.status !== "ok") {
