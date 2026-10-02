@@ -117,7 +117,7 @@ Review docs/my-spec.md and fix what it finds
 
 This edits the file in place. It does not checkpoint for you — a dirty tree is the normal case right after writing a doc, so gating on it would stall every run. Commit or stash first if the file holds work you'd hate to lose.
 
-**Proactive triggering** (if you installed `claude-md-snippet.md`): the skill fires on its own after Claude writes or substantially revises a spec, plan, or design doc. **It reports only — a review you didn't ask for never rewrites your file.** Note that it does send the document to OpenAI, Google, and — when the Fireworks key is set — Fireworks AI, without asking; the snippet instructs Claude to check with you first if the content looks sensitive, but if that trade isn't right for you, skip the snippet and invoke the skill by hand.
+**Proactive triggering** (if you installed `claude-md-snippet.md`): the skill fires on its own after Claude writes or substantially revises a spec, plan, or design doc, and before a decision record, legal draft, or letter leads to a deletion, filing, or send. **It reports only — a review you didn't ask for never rewrites your file.** Note that it does send the document to OpenAI, Google, and — when the Fireworks key is set — Fireworks AI, without asking; the snippet instructs Claude to check with you first if the content looks sensitive, but if that trade isn't right for you, skip the snippet and invoke the skill by hand.
 
 **What comes back** is one severity-ordered list, each finding tagged by origin:
 

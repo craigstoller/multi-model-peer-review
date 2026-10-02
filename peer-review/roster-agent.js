@@ -697,9 +697,14 @@ async function unlimitedDispatcher(fetchFn, g = globalThis) {
 // last. This reads it back into the shape of a non-stream chat-completions body, so nothing past
 // the body read changes: { model, usage, choices: [{ index: 0, message: { role: "assistant",
 // content, tool_calls }, finish_reason }] }, or { error } when a chunk carries one. Reasoning
-// arrives as delta.reasoning_content and is not read, as it never was. A cut stream has no
-// finish_reason, which stays undefined, and the missing-finish_reason handling applies. A data
-// line that is not JSON throws, and the caller reports a malformed body.
+// arrives as delta.reasoning_content and is not read, as it never was. A data line that is not
+// JSON throws, and the caller reports a malformed body. A stream that stops before `[DONE]`
+// assembles into a reply with no finish_reason, which this function cannot tell from a model's
+// own reply that left the field out: R20 (2026-10-02) has singleRequest ask streamReachedDone,
+// and read an error-free body from a stream that never reached `[DONE]` as a transport failure,
+// retried once. Before R20 an empty cut read as the model ending exploration on its own and
+// ended the run with time on the clock (field-reported 2026-10-01), and a cut that carried some
+// text came back as a truncated partial.
 function assembleStream(text) {
   let model, usage, finishReason, content = null;
   const calls = new Map();
@@ -744,6 +749,16 @@ function assembleStream(text) {
     });
   }
   return { model, usage, choices: [{ index: 0, message, finish_reason: finishReason }] };
+}
+// R20 -- whether a streamed reply reached its end. The lines are read as assembleStream reads
+// them: a trailing \r stripped, `data:` lines only, the payload trimmed, and a payload that is
+// exactly `[DONE]` is the end. A `[DONE]` inside a JSON payload, or on a comment line, is not.
+function streamReachedDone(text) {
+  for (const rawLine of String(text).split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line.startsWith("data:") && line.slice(5).trim() === "[DONE]") return true;
+  }
+  return false;
 }
 // R17 -- a response is read as a stream when it says it is one. A response with no headers
 // object (a test stub) is read as JSON, as every response was before requests streamed.
@@ -793,7 +808,10 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // The 2026-09-30 bump ships none in this script: SKILL.md's Codex command took
 // PR_LAUNCH (R19), the version line's date moved with it, and the tie rule
 // moves the constant with the date.
-const ROSTER_AGENT_VERSION = "2026-09-30";
+// 2026-10-02 is R20's behavior change in this script: a reply stream that ends before
+// `data: [DONE]` is a transport failure, retried once, where it used to be read back as the
+// model's own reply.
+const ROSTER_AGENT_VERSION = "2026-10-02";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -1552,6 +1570,17 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       // connection mid-generation (undici: TypeError: terminated), same as a
       // drop before the headers -- is a transport failure, so it is tagged
       // here and read by the shared catch below, next to the abort test.
+      // R20 -- so is a stream whose text() RESOLVES but that never reached
+      // `data: [DONE]`: a connection cut cleanly, which reads back as a reply
+      // with no finish_reason and, on the repo-aware route, as the model
+      // ending exploration on its own. An error-free body that is missing
+      // [DONE] throws "stream ended before [DONE]", tagged the same way, so it
+      // takes the one transport retry; the throw sits after assembleStream, so
+      // a body that carries an error (an in-stream error, a context-length
+      // error) keeps its handling with or without [DONE], and a stream that
+      // reaches [DONE] keeps its handling whether or not it names a
+      // finish_reason. Only a 2xx stream can be cut: a non-2xx response sent
+      // as an event stream keeps its http-error reason, HTTP status included.
       // Only a THROW FROM assembleStream (a non-JSON chunk, text() having
       // already resolved) is left untagged and falls to the malformed-body
       // branch.
@@ -1560,6 +1589,11 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
         try { text = await res.text(); }
         catch (e) { if (e && typeof e === "object") e.__streamReadFailure = true; throw e; }
         body = assembleStream(text);
+        if (res.ok && !(body && body.error) && !streamReachedDone(text)) {
+          const cut = new Error("stream ended before [DONE]");
+          cut.__streamReadFailure = true;
+          throw cut;
+        }
       }
       else body = await res.json();
     } catch (e) {
@@ -1568,8 +1602,9 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       // our own controller says so, or the error names itself AbortError
       // (what a real fetch implementation rejects the body promise with) --
       // or (R17) because the stream branch's res.text() itself rejected, for
-      // ANY reason (the __streamReadFailure tag set above). Any OTHER
-      // body-read failure -- i.e. assembleStream throwing on a non-JSON
+      // ANY reason, or (R20) because it resolved on a stream that ended before
+      // `data: [DONE]` (the __streamReadFailure tag set above, both ways). Any
+      // OTHER body-read failure -- i.e. assembleStream throwing on a non-JSON
       // chunk after text() already resolved -- is a genuinely non-JSON body
       // and keeps its byte-stable malformed-response reason.
       if (res === null) early = { transportError: true, error: e };
