@@ -661,9 +661,18 @@ const MIN_EXPLORATION_REQUEST_MS = 60 * 1000;
 // the time exploration left. MIN_EXPLORATION_REQUEST_MS and SLOW_REQUEST_MS
 // are shared. The caller picks the profile (the CLI reads FW_CLOCK); this
 // script never inspects the model string.
+// R18 -- extended is the background clock from R18 on: 1500 s with a 900 s reserve, the
+// exploration window still 600 s. long keeps R17's numbers for a session whose older command
+// still asks for it behind a 1215 s backstop. extended's ceiling is 960 s, the reserve plus
+// MIN_EXPLORATION_REQUEST_MS, not the reserve alone: the reserve trigger fires when less than
+// reserve + MIN_EXPLORATION_REQUEST_MS remains, so a synthesis turn entered on the reserve has
+// 900 to 960 s left, and a 960 s ceiling bounds its send by the time left and never by the ceiling.
+// A send that runs out then leaves nothing to retry with and ends (no wall-clock time left to
+// retry), where a 900 s ceiling ran it out at 900 s and launched a retry with what remained.
 const CLOCK_PROFILES = Object.freeze({
   standard: Object.freeze({ wallClockMs: WALL_CLOCK_MS, synthesisReserveMs: SYNTHESIS_RESERVE_MS, requestTimeoutCapMs: REQUEST_TIMEOUT_CAP_MS }),
   long: Object.freeze({ wallClockMs: 1200 * 1000, synthesisReserveMs: 600 * 1000, requestTimeoutCapMs: 900 * 1000 }),
+  extended: Object.freeze({ wallClockMs: 1500 * 1000, synthesisReserveMs: 900 * 1000, requestTimeoutCapMs: 960 * 1000 }),
 });
 // R17 -- Node's built-in fetch (undici) gives up on a response whose headers take more than
 // 300 s (UND_ERR_HEADERS_TIMEOUT, reported as a bare "fetch failed"), and on a body that sends
@@ -768,6 +777,55 @@ function isEventStream(res) {
   const type = h.get("content-type");
   return typeof type === "string" && type.toLowerCase().includes("text/event-stream");
 }
+// R18 -- a streamed body is read chunk by chunk, so the text that arrived before a cut
+// survives the cut. `got` is the caller's: got.text grows as chunks decode (a streaming
+// TextDecoder, so a multi-byte character split across chunks decodes once), and
+// got.lastChunkAt is the injected clock's time of the last chunk. A body with no reader (a
+// test stub that offers only text()) is read whole, as before R18.
+async function readStreamBody(res, got, clockNow) {
+  const reader = res.body && typeof res.body.getReader === "function" ? res.body.getReader() : null;
+  if (!reader) {
+    const text = await res.text();
+    got.text = text;
+    got.lastChunkAt = clockNow();
+    return text;
+  }
+  const decoder = new TextDecoder("utf-8");
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    got.text += decoder.decode(value, { stream: true });
+    got.lastChunkAt = clockNow();
+  }
+  got.text += decoder.decode();
+  return got.text;
+}
+
+// R18 -- what a cut stream had delivered: the characters of reasoning and of reply text in
+// its complete `data:` lines. An unfinished last line (no newline after it) is skipped and
+// noted; a line that is not JSON, a comment, `[DONE]` and an error chunk are skipped. Never
+// throws: a cut must never become a crash.
+function tallyPartialStream(text) {
+  const s = String(text);
+  const lines = s.split("\n");
+  let unfinishedLastLine = false;
+  if (!s.endsWith("\n") && lines[lines.length - 1] !== "") { unfinishedLastLine = true; lines.pop(); }
+  let reasoningChars = 0, replyChars = 0;
+  for (const raw of lines) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (payload === "" || payload === "[DONE]") continue;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { continue; }
+    const choice = chunk && Array.isArray(chunk.choices) ? chunk.choices[0] : null;
+    const delta = choice && choice.delta;
+    if (!delta || typeof delta !== "object") continue;
+    if (typeof delta.reasoning_content === "string") reasoningChars += delta.reasoning_content.length;
+    if (typeof delta.content === "string") replyChars += delta.content.length;
+  }
+  return { reasoningChars, replyChars, unfinishedLastLine };
+}
 // R12: the reporting threshold on the cap report's exploration line -- a
 // request slower than the pre-R12 cap, i.e. one the raise mattered for.
 // Part 4 renders the label ("over 120s") from this constant, never as a
@@ -815,7 +873,11 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // canary sentence is removed from the prompt, the script's own turns name the run's token, and
 // a mismatch whose reply ended normally on the document's exact last line, with review text
 // besides it, reports canary-document-line.
-const ROSTER_AGENT_VERSION = "2026-10-03";
+// 2026-10-04 is R18's behavior change in this script: the extended clock profile (1500 s wall
+// clock, 900 s synthesis reserve, 960 s per-request ceiling, the 600 s exploration window kept),
+// and a streamed body read chunk by chunk, with the cap report's `cut mid-stream:` line naming
+// each stream that stopped before `data: [DONE]`.
+const ROSTER_AGENT_VERSION = "2026-10-04";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
@@ -833,12 +895,13 @@ const FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions";
 // R17 -- a ceiling, not a budget. Fireworks bills the tokens a model
 // generates, not the cap, and lowers a cap past the context window to fit
 // rather than refusing it (probed 2026-09-27 up to 2,000,000). At measured
-// speeds (DeepSeek 65-80 tokens/s, Kimi about 45) even the long clock ends a
-// run before a model can write this many, so the clock, not the cap, stops a
-// runaway, and a cap that binds would only waste the thinking already paid
-// for. Whichever binds first, one request can bill at most this many output
-// tokens, about $2 at Kimi K3's 2026-09-27 rate. The sealed route carries the
-// same number.
+// speeds (DeepSeek 65-80 tokens/s, Kimi about 45) even the extended clock's
+// 960 s per-request ceiling ends a request before a model can write this many
+// (960 s at about 80 tokens/s is about 76,800 tokens, under 131072), so the
+// clock, not the cap, stops a runaway, and a cap that binds would only waste
+// the thinking already paid for. Whichever binds first, one request can bill
+// at most this many output tokens, about $2 at Kimi K3's 2026-09-27 rate. The
+// sealed route carries the same number.
 const MAX_TOKENS = 131072; // matches the sealed roster route's completion budget
 
 // resolveInRepo's seven reason strings (the confinement gate) -- see the
@@ -1212,6 +1275,8 @@ function emptyCaps() {
     // when the prompt held no CANARY: (or was never assembled).
     canarySentenceMatches: null,
     canaryInstructionRemains: null,
+    // R18 -- nothing sent, nothing cut.
+    cutStreams: [],
   };
 }
 
@@ -1273,7 +1338,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
   // absent is the standard profile, whose numbers are the constants above.
   const profileName = (clockProfile === undefined || clockProfile === "") ? "standard" : clockProfile;
   if (typeof profileName !== "string" || !Object.prototype.hasOwnProperty.call(CLOCK_PROFILES, profileName)) {
-    throw new TypeError('clockProfile must be "standard" or "long"');
+    throw new TypeError('clockProfile must be "standard", "long" or "extended"');
   }
   const clock = CLOCK_PROFILES[profileName];
   const clockCaps = { profile: profileName, wallClockMs: clock.wallClockMs, synthesisReserveMs: clock.synthesisReserveMs, requestTimeoutCapMs: clock.requestTimeoutCapMs };
@@ -1467,6 +1532,8 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
     // singleRequest's `finally`, whenever jumpMs exceeds
     // CLOCK_JUMP_THRESHOLD_MS. See emptyCaps above for the "no jump" values.
     clockJumpMs: 0, clockJumpRequests: 0,
+    // R18 -- one entry per stream cut mid-body (see singleRequest).
+    cutStreams: [],
   };
   // R12 -- the EXPLORATION budget: the wall clock an exploration send may
   // spend without eating into the reserve the synthesis turn is owed. The
@@ -1560,6 +1627,8 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       fetchTimeoutsLifted,
       // R23 -- mirrors emptyCaps() above field for field.
       canarySentenceMatches, canaryInstructionRemains,
+      // R18 -- mirrors emptyCaps() above.
+      cutStreams: flags.cutStreams.map((c) => ({ ...c })),
     };
   }
 
@@ -1627,8 +1696,9 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       init.signal = controller.signal;
       timer = scheduleTimeout(() => controller.abort(), Math.max(1, timeoutMs));
     }
-    // R12 -- THE PER-REQUEST BOUND COVERS THE BODY. The body read (R17:
-    // res.text() for a stream, res.json() otherwise) is awaited inside the
+    // R12 -- THE PER-REQUEST BOUND COVERS THE BODY. The body read (R17, R18:
+    // readStreamBody for a stream -- the reader, or text() when the body has
+    // none -- and res.json() otherwise) is awaited inside the
     // SAME try as doFetch, and the timer is cancelled in a
     // `finally` after BOTH. Cancelling at headers (what pre-R12 code did)
     // left the body read unbounded: a provider that sends headers promptly
@@ -1649,11 +1719,11 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       res = await doFetch(FIREWORKS_URL, init);
       // R17 -- a streamed reply is read whole and assembled into the
       // non-stream shape; a non-stream reply is read exactly as before. A
-      // rejection of the stream branch's res.text() itself -- a dropped
+      // rejection of the stream branch's body read itself -- a dropped
       // connection mid-generation (undici: TypeError: terminated), same as a
       // drop before the headers -- is a transport failure, so it is tagged
       // here and read by the shared catch below, next to the abort test.
-      // R20 -- so is a stream whose text() RESOLVES but that never reached
+      // R20 -- so is a stream whose body read RESOLVES but that never reached
       // `data: [DONE]`: a connection cut cleanly, which reads back as a reply
       // with no finish_reason and, on the repo-aware route, as the model
       // ending exploration on its own. An error-free body that is missing
@@ -1664,15 +1734,38 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       // reaches [DONE] keeps its handling whether or not it names a
       // finish_reason. Only a 2xx stream can be cut: a non-2xx response sent
       // as an event stream keeps its http-error reason, HTTP status included.
-      // Only a THROW FROM assembleStream (a non-JSON chunk, text() having
+      // Only a THROW FROM assembleStream (a non-JSON chunk, the body read having
       // already resolved) is left untagged and falls to the malformed-body
       // branch.
       if (isEventStream(res)) {
         let text;
-        try { text = await res.text(); }
-        catch (e) { if (e && typeof e === "object") e.__streamReadFailure = true; throw e; }
-        body = assembleStream(text);
+        const got = { text: "", lastChunkAt: null };
+        // R18 -- a 2xx stream that stops before [DONE], for any cause, is recorded with what it
+        // had delivered. The cause is the clock when this request's own controller aborted it, a
+        // transport fault otherwise. A stream that had already delivered [DONE] is not cut,
+        // whatever happens to the connection after it.
+        const noteCut = () => {
+          if (!res.ok || streamReachedDone(got.text)) return;
+          const at = clockNow();
+          const t = tallyPartialStream(got.text);
+          flags.cutStreams.push({
+            phase: sentInFinalPhase ? "synthesis" : "exploration",
+            cause: controller && controller.signal && controller.signal.aborted ? "clock" : "transport",
+            ms: at - t0,
+            reasoningChars: t.reasoningChars,
+            replyChars: t.replyChars,
+            gapMs: got.lastChunkAt === null ? null : at - got.lastChunkAt,
+            unfinishedLastLine: t.unfinishedLastLine,
+          });
+        };
+        try { text = await readStreamBody(res, got, clockNow); }
+        catch (e) { noteCut(); if (e && typeof e === "object") e.__streamReadFailure = true; throw e; }
+        // A stream that closed cleanly inside a line also stopped before [DONE]: it is recorded,
+        // and assembleStream's throw keeps today's malformed-response reading (left untagged).
+        try { body = assembleStream(text); }
+        catch (e) { noteCut(); throw e; }
         if (res.ok && !(body && body.error) && !streamReachedDone(text)) {
+          noteCut();
           const cut = new Error("stream ended before [DONE]");
           cut.__streamReadFailure = true;
           throw cut;
@@ -1684,12 +1777,14 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
       // rejects is one too when it rejects because the bound fired -- either
       // our own controller says so, or the error names itself AbortError
       // (what a real fetch implementation rejects the body promise with) --
-      // or (R17) because the stream branch's res.text() itself rejected, for
+      // or (R17) because the stream branch's body read itself rejected, for
       // ANY reason, or (R20) because it resolved on a stream that ended before
       // `data: [DONE]` (the __streamReadFailure tag set above, both ways). Any
       // OTHER body-read failure -- i.e. assembleStream throwing on a non-JSON
-      // chunk after text() already resolved -- is a genuinely non-JSON body
-      // and keeps its byte-stable malformed-response reason.
+      // chunk after readStreamBody had read the stream chunk by chunk to its
+      // end (or text() had resolved, where the body has no reader) -- is a
+      // genuinely non-JSON body and keeps its byte-stable malformed-response
+      // reason.
       if (res === null) early = { transportError: true, error: e };
       else if ((controller && controller.signal && controller.signal.aborted) || (e && e.name === "AbortError") || (e && e.__streamReadFailure)) {
         early = { transportError: true, error: e };
@@ -2303,7 +2398,7 @@ async function runReview({ docPath, repoRoot, model, prompt, fetchImpl, dispatch
 
 const USAGE = [
   "usage: node roster-agent.js <doc-path> <repo-root>",
-  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported; FW_REASONING_EFFORT and FW_CLOCK (empty or standard, or long for a call launched in the background) are optional.",
+  "  FW_MODEL, FW_PROMPT_REPO_AWARE and FIREWORKS_API_KEY must be exported; FW_REASONING_EFFORT and FW_CLOCK (empty or standard; long or extended for a call launched in the background) are optional.",
 ].join("\n");
 
 function clip(value, max) {
@@ -2396,6 +2491,14 @@ function describeSynthesisEntry(caps) {
   return "on exploration failure -- " + sanitizeReason(caps.explorationFailure);
 }
 
+// R18 -- one cut stream, as the cap report's cut line prints it.
+function formatCut(c) {
+  return c.phase + " " + c.cause + " " + formatSeconds(c.ms) +
+    " (received reasoning " + c.reasoningChars + " chars, reply " + c.replyChars + " chars, " +
+    (c.gapMs === null ? "no data before the cut" : "last data " + formatSeconds(c.gapMs) + " before the cut") +
+    (c.unfinishedLastLine ? ", unfinished last line" : "") + ")";
+}
+
 function formatCaps(caps, reviewed) {
   const hit = [];
   if (caps.readsCapHit) hit.push("file reads (" + READS_CAP + ")");
@@ -2480,6 +2583,11 @@ function formatCaps(caps, reviewed) {
         " with " + formatSeconds(caps.synthesisEntryRemainingMs) + " remaining" +
         "   requests " + caps.synthesisRequests +
         "   longest " + formatSeconds(caps.synthesisLongestMs),
+    // R18 -- printed UNCONDITIONALLY, `none` included, for the reason the lines above are:
+    // a missing line means an older copy, not a run with nothing cut. What a cut stream had
+    // delivered, received characters not the model's state; the only cost signal for a cut
+    // request, whose usage is never reported.
+    "  cut mid-stream: " + (Array.isArray(caps.cutStreams) && caps.cutStreams.length > 0 ? caps.cutStreams.map(formatCut).join("; ") : "none"),
     // R15 -- printed only when a jump was measured; the zero case is silent
     // so a clean report reads exactly as before.
     ...(caps.clockJumpMs > 0
@@ -2541,11 +2649,11 @@ async function main() {
   const reasoningEffort = effortRaw === "" ? undefined : (/^\d+$/.test(effortRaw) ? Number(effortRaw) : effortRaw);
   // R17 -- the clock profile from the environment, trimmed: empty or
   // `standard` is the standard clock (the only one a foreground Bash call can
-  // run), `long` is for a call launched in the background. Anything else is refused here,
-  // on the same path as a bad FW_REASONING_EFFORT, before any request.
+  // run), `long` and `extended` (R18) are for a call launched in the background. Anything
+  // else is refused here, on the same path as a bad FW_REASONING_EFFORT, before any request.
   const clockRaw = (process.env.FW_CLOCK || "").trim();
-  if (clockRaw !== "" && clockRaw !== "standard" && clockRaw !== "long") {
-    process.stderr.write("FW_CLOCK must be empty, standard or long; got: " + clockRaw + "\n");
+  if (clockRaw !== "" && clockRaw !== "standard" && clockRaw !== "long" && clockRaw !== "extended") {
+    process.stderr.write("FW_CLOCK must be empty, standard, long or extended; got: " + clockRaw + "\n");
     return 2;
   }
   const prompt = process.env.FW_PROMPT_REPO_AWARE;
