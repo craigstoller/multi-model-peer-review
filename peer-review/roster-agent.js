@@ -29,15 +29,17 @@
 // the process runs with the invoking user's full privileges, and a defect in
 // the gate is a defect in the whole confinement story. The SEALED roster
 // route in SKILL.md is the structural guarantee (its code path contains no
-// file-reading capability at all), and that is what an outside document
-// gets.
+// file-reading capability at all), and it runs when the user picks it. Since
+// R27 a document from outside the project gets this repo-aware route, as
+// any document reviewed inside a repository does.
 //
 // The `.git` skip in Part 1 is a CONVENIENCE, not a fence: it keeps the
 // model out of repository plumbing it has no reason to read. It is not a
 // security boundary and must not be described as one -- git data reachable
-// under some other name is inside the repo and therefore allowed. The honest
-// control for secrets is not pointing a repo-aware review at a repository
-// that holds them.
+// under some other name is inside the repo and therefore allowed. The gate
+// refuses no secret-shaped name either: the honest control for secrets is
+// keeping them out of the tree, and SKILL.md's secret-file check names the
+// ones it can see.
 //
 // STRUCTURE. Parts 1-3 are concatenated VERBATIM from this project's three
 // development modules, in dependency order; a drift test asserts each body
