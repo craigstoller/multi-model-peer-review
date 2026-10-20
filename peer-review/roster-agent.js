@@ -879,7 +879,7 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // clock, 900 s synthesis reserve, 960 s per-request ceiling, the 600 s exploration window kept),
 // and a streamed body read chunk by chunk, with the cap report's `cut mid-stream:` line naming
 // each stream that stopped before `data: [DONE]`.
-const ROSTER_AGENT_VERSION = "2026-10-04";
+const ROSTER_AGENT_VERSION = "2026-10-20";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
