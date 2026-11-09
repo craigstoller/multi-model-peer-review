@@ -690,12 +690,44 @@ const CLOCK_PROFILES = Object.freeze({
 // from the global dispatcher's own class; a data: fetch creates the global dispatcher when no
 // request has yet. Where none can be built, requests go out as before, and the cap report says
 // so.
-const GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+// R37 -- Node 26 moved the class. Measured 2026-11-05 on v26.13.0 (undici 8.12.2): after a data:
+// fetch, `undici.globalDispatcher.1` holds a Dispatcher1Wrapper whose constructor wants a
+// dispatcher and throws `Argument dispatcher must implement dispatch` when handed the timeout
+// options, and the Agent sits under `undici.globalDispatcher.2`, where the options build it. So the
+// dispatcher is built from the highest-numbered `undici.globalDispatcher.N` on the global whose
+// class takes the options and yields an object with a dispatch function; `.1`, the only symbol on
+// the Node versions before, is the fall-back; and none usable still returns null, which keeps the
+// cap report's `fetch:` line for that case. The scan runs first; when it finds nothing usable -- no
+// symbol yet, or only a class a preload put there before fetch initialized -- one data: fetch
+// creates the global dispatcher and the scan runs once more (the panel's catch on this entry:
+// probing only when no symbol existed would have left such a global without the lift).
+const GLOBAL_DISPATCHER_RE = /^undici\.globalDispatcher\.(\d+)$/;
+function globalDispatcherSymbols(g) {
+  return Object.getOwnPropertySymbols(g)
+    .map((s) => { const m = GLOBAL_DISPATCHER_RE.exec(s.description || ""); return m ? { s, n: Number(m[1]) } : null; })
+    .filter(Boolean)
+    .sort((a, b) => b.n - a.n)
+    .map((x) => x.s);
+}
 async function unlimitedDispatcher(fetchFn, g = globalThis) {
+  const build = () => {
+    for (const sym of globalDispatcherSymbols(g)) {
+      const d = g[sym];
+      if (!d || typeof d.constructor !== "function") continue;
+      try {
+        const built = new d.constructor({ headersTimeout: 0, bodyTimeout: 0 });
+        if (built && typeof built.dispatch === "function") return built;
+      } catch (e) {
+        // This class does not take the options (Node 26's wrapper): try the next symbol down.
+      }
+    }
+    return null;
+  };
   try {
-    if (!g[GLOBAL_DISPATCHER]) await fetchFn("data:,");
-    const d = g[GLOBAL_DISPATCHER];
-    return d && typeof d.constructor === "function" ? new d.constructor({ headersTimeout: 0, bodyTimeout: 0 }) : null;
+    const found = build();
+    if (found) return found;
+    await fetchFn("data:,");
+    return build();
   } catch (e) {
     return null;
   }
@@ -879,7 +911,7 @@ const CLOCK_JUMP_THRESHOLD_MS = 5 * 1000;
 // clock, 900 s synthesis reserve, 960 s per-request ceiling, the 600 s exploration window kept),
 // and a streamed body read chunk by chunk, with the cap report's `cut mid-stream:` line naming
 // each stream that stopped before `data: [DONE]`.
-const ROSTER_AGENT_VERSION = "2026-10-20";
+const ROSTER_AGENT_VERSION = "2026-11-05.4";
 const PATH_REFUSAL_LIMIT = 3;           // gate refusals for the same resolved path before short-circuiting
 // R9: the final-phase synthesis-turn state machine. At most SYNTHESIS_RETRIES
 // launched retries per run, one shared budget across both retry causes (a
