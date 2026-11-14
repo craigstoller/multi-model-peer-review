@@ -4,6 +4,20 @@ Newest first. `SKILL.md` carries its version on line 6; every change to it shoul
 
 Until 2026-10-02.2 these entries lived on line 6 itself, as one paragraph that had grown to about 44 KB. Each was moved here word for word, except that the word "Plus" joining it to the entry before was dropped and its first letter capitalized. The 2026-08-20 entry keeps one inner "Plus": R8 and R9 both shipped under that version.
 
+## 2026-11-05.14
+
+A text change in two passages, beside the version line; no command changes and `ROSTER_AGENT_VERSION` keeps its version. Engine 2's pin bullet ended by saying R40 measures `-high` against `-medium`. It now says what R41 measured on 2026-11-12, the measure that replaced that one (the operator's ruling on its design, 2026-11-11, amended R40), and leads with why the pin stays:
+- The pin stays on `gemini-4-argon-high` because Carbon High failed the measure's reliability and time gates; its quality comparison was inconclusive, Carbon producing one scored review of a document that needed two. The operator ruled on the gates, before the quality scoring (R41).
+- The measure's scope: first-round reviews on the background clock, this command with each arm's slug and a log file added, two calls at a time on one account, agy 1.5.6 then 1.5.7, five documents of this skill's development repository.
+- On the four documents scored for quality, Argon reviewed in 10 of 11 slots, its one loss an upstream error and then a canary mismatch, and Carbon in 9 of 11, every failed attempt the `command` denial, all five on one document. A twelfth round, lost to the network and then agy's account for both, was set apart. Carbon's median review time was 2.5 and 3.1 times Argon's on two documents, the second resting on one Carbon review.
+- Argon's reviews of the 62 KB plan took 600 s and 870 s in the measure, so a foreground run that size may overrun the 7-minute print timeout, untested.
+- Pooled over the four documents, Carbon held slightly more major findings per review (2.6 against 2.2), with low reader agreement on severity.
+- Invented quotations, counted by R41's script and blind readers: 6.6 per review for Argon and 4.9 for Carbon; over prose spans offered as quotations, 9.3% and 5.9% with overlapping span-level intervals, optimistic since quotations cluster, and 2.0% and 1.0% under a later audit that set formatting aside.
+- Hydrogen High reviewed in none of 5 probe attempts, each ending on the denial; the Orchestrators and Argon Medium were not run.
+- The bullet on adding nothing to agy's prompt says Argon met no denial in R41's measure either, where Carbon did, as Hydrogen did in its probe.
+
+The passage was first changed on a branch as 2026-11-05.12, reporting R41's probe of Carbon High of 2026-11-11 (3 of 5 attempts reviewed, two denials); that version never shipped, and main's 2026-11-05.12 is R42. This entry replaces that probe's report with the measure's result; the probe's figures stay in R41.
+
 ## 2026-11-05.13
 
 A behavior change in Engine 1's command and the diff block: both pass `-c web_search="disabled"`, which switches off Codex's built-in `web` tool for the reviewer; under the shipped flags the reviewer listed none (R43). Fact-checking, the one use of the web this file documents, now opts in for a run by changing that value to `cached`; `codex --search exec`, documented until now, does nothing for `exec` on codex-cli 0.167.1.
