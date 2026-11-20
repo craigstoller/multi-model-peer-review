@@ -4,6 +4,17 @@ Newest first. `SKILL.md` carries its version on line 6; every change to it shoul
 
 Until 2026-10-02.2 these entries lived on line 6 itself, as one paragraph that had grown to about 44 KB. Each was moved here word for word, except that the word "Plus" joining it to the entry before was dropped and its first letter capitalized. The 2026-08-20 entry keeps one inner "Plus": R8 and R9 both shipped under that version.
 
+## 2026-11-05.15
+
+A behavior change: agy's pin moves from `gemini-4-argon-high` to `gemini-4-neon-high` (R44), in Engine 2's command and its model check, in the preflight, and in the Codex host's script. The bounds do not change, and `ROSTER_AGENT_VERSION` keeps its version. Why: Google released Gemini 4 Neon and, by the operator's report, plans to replace Argon with it; on 2026-11-19 the operator moved the pin. agy 1.5.13 listed `gemini-4-neon-high`, `-xhigh`, `-medium` and `-low`. That day this command with only the slug changed reviewed in 3 of 5 attempts, one at a time, each review with an exact canary: a 5 KB decision record in 112 s and a 62 KB plan in 225 s and 283 s, on the background clock. The other two, on the plan, one on each clock, ended on the `command` denial within a minute, Neon asking to run `git show` on files as they stood at the commit the plan names. Carbon High had the same counts on the same two documents (R41); Argon had reviewed in 5 of 5, three on `-high` and two on `-medium` (R32). agy's logs on the PC held 4 denials in 8 Neon print-mode runs by that day, against 11 in 219 Argon High runs since 2026-11-05.
+
+With it:
+- Engine 2's pin bullet is a Neon bullet: the probe and its limits, the counts from agy's logs, the bounds unchanged with the warning that a foreground review of a document the plan's size may overrun the print timeout, and a shorter history of the earlier pins. R41's measure of Argon against Carbon stays beside the pin, as R40 asks, in brief: the quotation rates, the reliability and time gates Carbon failed, the major findings and the inconclusive quality comparison. § *Merge the reviews*'s quotation check still applies to every model.
+- The bullet on adding nothing to agy's prompt says Neon met the denial in 2 of its 5 probe runs with the prompt as it ships.
+- The model check's bullet gives `gemini-4-neon-high` as its example slug.
+- Troubleshooting's entry for the `command` denial quotes the rest of agy 1.5.13's message, which suggests an allow-rule in `settings.json` or `--dangerously-skip-permissions`, says to take neither, and says agy's log names the denied tool `Bash` from 1.5.9 where it named `RunCommand` before.
+- Tests: `test-drift.sh`'s `R22_VERSION`, its three `agy models` stubs and its three R33 rows; R41's measure suite, whose fixtures now read `SKILL.md` at R41's approved commit, `681a9e6`, since the live file no longer holds the Argon line that measure froze; the Codex test's stub, launch assertion and refusal row; compliance case C6, its row in `pattern-scopes.tsv`, the compliance stub's model list and its row in `test-stubs.sh`, and the five canned transcripts that hold an agy launch.
+
 ## 2026-11-05.14
 
 A text change in two passages, beside the version line; no command changes and `ROSTER_AGENT_VERSION` keeps its version. Engine 2's pin bullet ended by saying R40 measures `-high` against `-medium`. It now says what R41 measured on 2026-11-12, the measure that replaced that one (the operator's ruling on its design, 2026-11-11, amended R40), and leads with why the pin stays:
